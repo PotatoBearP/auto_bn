@@ -62,91 +62,10 @@ def find_icon(image,template='heavy-gunner-icon.png'):
     return best[1]
 
 def deploy(columns=(2,4)):
-    hwnd = app.find_game()
-    app.focus_game(hwnd)
-    box = app.bounds(hwnd)
-    if abs(box[2]-box[0]-1366)>2 or abs(box[3]-box[1]-768)>2:
-        raise RuntimeError('当前布阵校准适用于 1366×768 游戏画面，请恢复该尺寸。')
-    reports=[]
-    def check():
-        control.check()
-        if app.user32.GetForegroundWindow()!=hwnd or app.bounds(hwnd)!=box:
-            raise RuntimeError('窗口或焦点改变，已停止布阵。')
-    def wait_gunner(position):
-        deadline=time.monotonic()+2
-        while True:
-            check()
-            frame=ImageGrab.grab(bbox=box,all_screens=True)
-            if gunner_present(frame,position) or time.monotonic()>=deadline:
-                return frame
-            time.sleep(.08)
-    for column in columns:
-        check()
-        image=ImageGrab.grab(bbox=box,all_screens=True)
-        image.save(ROOT/f'deployment-before-{column}.png')
-        destination=PROFILE['front_row'][column-1]
-        if gunner_present(image,destination):
-            reports.append({'column':column,'status':'already_placed'})
-            continue
-        green=sum(g>100 and g>r*1.4 and g>b*1.4 for r,g,b in image.convert('RGB').crop((1200,450,1360,570)).getdata())
-        if green<1500: raise RuntimeError('未检测到布阵界面的绿色开战按钮。')
-        if gunner_present(image,PROFILE['spawn']): raise RuntimeError('默认格已有重机枪手，请先调整已有单位。')
-        icon=find_icon(image)
-        mouse.click(box[0]+icon[0],box[1]+icon[1])
-        image=wait_gunner(PROFILE['spawn'])
-        if not gunner_present(image,PROFILE['spawn']): raise RuntimeError('点选后未检测到默认格中的重机枪手。')
-        actual=mouse.drag((box[0]+599,box[1]+390),(box[0]+destination[0],box[1]+destination[1]),check)
-        image=wait_gunner(destination)
-        image.save(ROOT/f'deployment-after-{column}.png')
-        if not gunner_present(image,destination): raise RuntimeError(f'第 {column} 格未通过摆放检查。')
-        reports.append({'column':column,'status':'placed','actual_cursor':list(actual)})
-    check()
-    image=ImageGrab.grab(bbox=box,all_screens=True)
-    destination=PROFILE['experience_aircraft']
-    if aircraft_present(image,destination):
-        reports.append({'unit':'first_aircraft','cell':destination,'status':'already_placed'})
-    else:
-        existing=[cell for cell in aircraft_cells() if aircraft_present(image,cell)]
-        if len(existing)>1: raise RuntimeError('检测到多个飞机位置，停止重复部署。')
-        if not existing:
-            icon=None
-            # Toolbar wheel scrolling only; never pan the board while searching.
-            for attempt in range(12):
-                check()
-                try:
-                    icon=find_icon(image,'first-aircraft-icon.png')
-                    break
-                except RuntimeError:
-                    if attempt==11: raise
-                    mouse.move(box[0]+500,box[1]+730)
-                    mouse.scroll(240)
-                    time.sleep(.12)
-                    image=ImageGrab.grab(bbox=box,all_screens=True)
-            mouse.click(box[0]+icon[0],box[1]+icon[1])
-            deadline=time.monotonic()+3
-            while True:
-                check()
-                image=ImageGrab.grab(bbox=box,all_screens=True)
-                existing=[cell for cell in aircraft_cells() if aircraft_present(image,cell)]
-                if existing: break
-                if time.monotonic()>=deadline: raise RuntimeError('点击后未定位第一架飞机，停止重复点击。')
-                time.sleep(.08)
-        if len(existing)!=1: raise RuntimeError('飞机生成格不唯一，未拖动。')
-        source=existing[0]
-        if source!=tuple(destination):
-            mouse.drag((box[0]+source[0],box[1]+source[1]),
-                       (box[0]+destination[0],box[1]+destination[1]),check)
-        deadline=time.monotonic()+2
-        while True:
-            check()
-            image=ImageGrab.grab(bbox=box,all_screens=True)
-            if aircraft_present(image,destination): break
-            if time.monotonic()>=deadline: raise RuntimeError('飞机后排第 2 格摆放检查失败，未开战。')
-            time.sleep(.08)
-        reports.append({'unit':'first_aircraft','cell':destination,'status':'placed'})
-    ImageGrab.grab(bbox=box,all_screens=True).save(ROOT/'deployment-complete.png')
-    (ROOT/'deployment-result.json').write_text(json.dumps(reports,indent=2),encoding='utf-8')
-    return reports
+    import formation
+    config=formation.validate({'version':1,'units':[
+        {'row':1,'column':column,'unit':'heavy_gunner'} for column in columns]})
+    return deploy_formation(config)
 
 def locate_start_button(image):
     pixels=image.convert('RGB').load()
@@ -173,16 +92,75 @@ def locate_start_button(image):
     if '开战' not in text: raise RuntimeError('绿色按钮未通过“开战”文字核对，已停止。')
     return ((left+right)//2,(top+bottom)//2),(left,top,right,bottom),text
 
-def start_battle():
+def deploy_formation(config):
+    """Place registered units in configured cells; discover their actual spawn cell."""
+    import formation
+    config=formation.validate(config)
+    hwnd=app.find_game();app.focus_game(hwnd);box=app.bounds(hwnd)
+    if abs(box[2]-box[0]-1366)>2 or abs(box[3]-box[1]-768)>2:
+        raise RuntimeError('自定义部署适用于约 1366×768 游戏画面。')
+    def check():
+        control.check()
+        if app.user32.GetForegroundWindow()!=hwnd or app.bounds(hwnd)!=box:
+            raise RuntimeError('窗口或焦点改变，停止部署。')
+    def capture():
+        check();return ImageGrab.grab(bbox=box,all_screens=True)
+    board=[formation.position(r,c) for r,c in formation.cells()]
+    reports=[]
+    def place(destination,present,template,label):
+        image=capture()
+        if present(image,destination): return 'already_placed'
+        # Keep the central spawn free until the last placement.
+        before={cell for cell in board if present(image,cell)}
+        for attempt in range(37):
+            try:
+                icon=find_icon(image,template);break
+            except RuntimeError:
+                if attempt==36: raise
+                check();mouse.move(box[0]+500,box[1]+730)
+                mouse.scroll(-240 if attempt<12 else 240)
+                time.sleep(.12);image=capture()
+        locate_start_button(image) # Still in deployment, before adding a unit.
+        check();mouse.click(box[0]+icon[0],box[1]+icon[1])
+        deadline=time.monotonic()+3
+        while True:
+            image=capture()
+            spawned=[cell for cell in board if cell not in before and present(image,cell)]
+            if len(spawned)==1: break
+            if time.monotonic()>=deadline:
+                raise RuntimeError(f'{label}生成格未可靠定位，停止重复添加。')
+            time.sleep(.08)
+        source=spawned[0]
+        if source!=destination:
+            if any(ai.present(image,destination) for _,ai in formation.units(config)):
+                raise RuntimeError('目标格已有单位，停止拖动。')
+            mouse.drag((box[0]+source[0],box[1]+source[1]),
+                       (box[0]+destination[0],box[1]+destination[1]),check)
+        deadline=time.monotonic()+3
+        while not present(capture(),destination):
+            if time.monotonic()>=deadline: raise RuntimeError(f'{label}目标格检查失败，未开战。')
+            time.sleep(.08)
+        return 'placed'
+    entries=sorted(config['units'],key=lambda u:formation.position(u['row'],u['column'])==tuple(PROFILE['spawn']))
+    from unit_ai import get
+    for entry in entries:
+        ai=get(entry['unit']);cell=formation.position(entry['row'],entry['column'])
+        status=place(cell,ai.present,ai.icon_template,ai.name)
+        reports.append({**entry,'name':ai.name,'cell':list(cell),'status':status})
+    capture().save(ROOT/'deployment-complete.png')
+    (ROOT/'deployment-result.json').write_text(json.dumps(reports,ensure_ascii=False,indent=2),encoding='utf-8')
+    return reports
+
+def start_battle(config=None):
     hwnd=app.find_game(); app.focus_game(hwnd)
     box=app.bounds(hwnd)
     if abs(box[2]-box[0]-1366)>2 or abs(box[3]-box[1]-768)>2:
         raise RuntimeError('当前开战前摆放检查适用于 1366×768 游戏画面。')
     image=ImageGrab.grab(bbox=box,all_screens=True)
-    if not all(gunner_present(image,PROFILE['front_row'][i-1]) for i in (2,4)):
-        raise RuntimeError('第一排 2、4 格未通过机枪手摆放检查，未开战。')
-    if not aircraft_present(image,PROFILE['experience_aircraft']):
-        raise RuntimeError('第一个机枪手后方未通过飞机摆放检查，未开战。')
+    import formation
+    config=formation.validate(config or formation.defaults())
+    for cell,ai in formation.units(config):
+        if not ai.present(image,cell): raise RuntimeError(f'{ai.name}在配置格 {cell} 未通过摆放检查，未开战。')
     point,region,text=locate_start_button(image)
     image.save(ROOT/'start-before.png')
     if app.user32.GetForegroundWindow()!=hwnd or app.bounds(hwnd)!=box:
@@ -209,19 +187,27 @@ def start_battle():
         raise RuntimeError('已点击一次开战，等待 20 秒后按钮仍可见；可能仍在加载，请查看游戏。')
     from combat import reset_battle_state
     reset_battle_state()
+    formation.activate(config)
     return result
 
 def deploy_and_start():
-    placements=deploy()
-    return {'placements':placements,'start':start_battle()}
+    import formation
+    config=formation.load()
+    placements=deploy_formation(config)
+    return {'formation':config,'placements':placements,'start':start_battle(config)}
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser()
-    parser.add_argument('--columns',nargs='+',type=int,default=[2,4],choices=range(1,6))
+    parser.add_argument('--columns',nargs='+',type=int,choices=range(1,6))
     parser.add_argument('--start-only',action='store_true')
     parser.add_argument('--no-start',action='store_true')
     args=parser.parse_args()
-    if args.start_only: result=start_battle()
-    elif args.no_start: result=deploy(args.columns)
-    else: result={'placements':deploy(args.columns),'start':start_battle()}
+    import formation
+    config=formation.load()
+    if args.columns is not None:
+        config=formation.validate({'version':1,'units':[{'row':1,'column':c,'unit':'heavy_gunner'}
+                                  for c in args.columns]})
+    if args.start_only: result=start_battle(config)
+    elif args.no_start: result=deploy_formation(config)
+    else: result={'formation':config,'placements':deploy_formation(config),'start':start_battle(config)}
     print(json.dumps(result,ensure_ascii=True))

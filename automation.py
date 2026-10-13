@@ -47,7 +47,7 @@ def run_battle(progress=lambda message:None,max_actions=100,timeout=900,resume=F
                 report['encounter']=app.encounter(True)
             save()
             wait_deployment()
-            progress('正在布置两名机枪手及后排第一架飞机，并开战…')
+            progress('正在按已保存的自定义阵型部署单位并开战…')
             report['deployment']=deployment.deploy_and_start();save()
         deadline=time.monotonic()+timeout
         for number in range(len(report['actions'])+1,max_actions+1):

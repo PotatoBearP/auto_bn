@@ -7,12 +7,14 @@ from PIL import ImageGrab, Image, ImageChops, ImageStat
 import app
 import mouse_backend as mouse
 import control
+import formation
+from unit_ai import get as unit_ai
 from settlement import phase as settlement_phase
 
 from paths import COMBAT, TEMPLATES
 ROOT=COMBAT
 PLAYERS=[(489,335),(709,445)]
-SKILLS={1:(300,721),2:(404,721)}
+SKILLS=unit_ai('heavy_gunner').skill_points
 
 class BattleEnded(RuntimeError):
     def __init__(self,image):
@@ -177,8 +179,11 @@ def cooldown(image,skill,read_turns=True):
 
 def health_bars(image):
     rgb=image.convert('RGB'); pixels=rgb.load(); results=[]
-    for y in range(110,540):
-        x=400
+    friendly=formation.friendly_positions()
+    scan_left=max(0,min([400]+[p[0]-50 for p in friendly]))
+    scan_bottom=min(image.height-20,max([540]+[p[1]+50 for p in friendly]))
+    for y in range(110,scan_bottom):
+        x=scan_left
         while x<1160:
             if max(pixels[x,y])>=32: x+=1; continue
             left=x
@@ -195,7 +200,7 @@ def health_bars(image):
                            for offset in (13,14,15,16))
                 if dark<interior.width*interior.height*.75 or bottom<(x-left-6)*.9: continue
             foot=((left+x)//2,y-34)
-            if any(abs(foot[0]-p[0])<45 and abs(foot[1]-p[1])<15 for p in PLAYERS): side='friendly'
+            if any(abs(foot[0]-p[0])<45 and abs(foot[1]-p[1])<15 for p in friendly): side='friendly'
             else: side='enemy'
             dx=(foot[0]-544)/110; dy=(foot[1]-196)/55
             row=round((dx-dy)/2)+1;column=round((dx+dy)/2)+1
@@ -289,24 +294,16 @@ def area_hits(image,enemies):
     return hits
 
 def skill_hits(image,enemies,skill):
-    return area_hits(image,enemies) if skill==2 else outline_hits(image,enemies)
+    return unit_ai('heavy_gunner').hits(image,enemies,skill)
 
 def sweep_targets(enemies):
     """Aim once per column at its front unit, highest remaining HP first."""
-    columns={}
-    for enemy in enemies:
-        x,y=enemy['foot']
-        dx=(x-544)/110; dy=(y-196)/55
-        column=enemy.get('column',round((dx+dy)/2)+1)
-        row=enemy.get('row',round((dx-dy)/2)+1)
-        columns.setdefault(column,[]).append((row,enemy))
-    health={column:sum(max(0,e.get('hp_fraction',1.0)) for _,e in units)
-            for column,units in columns.items()}
-    ordered=sorted(columns,key=lambda c:(-health[c],
-                   -.2*(health.get(c-1,0)+health.get(c+1,0)),c))
-    return [tuple(min(columns[c],key=lambda item:item[0])[1]['foot']) for c in ordered]
+    return unit_ai('heavy_gunner').targets(enemies,2)
 
 def _combat_step(preview_only=False,force_skill=None,context=None):
+    controllers=dict(formation.units())
+    players=list(controllers)
+    if not players: raise RuntimeError('阵型中没有可操作的 AI 单位。')
     hwnd=app.find_game()
     if app.user32.IsIconic(hwnd): app.user32.ShowWindow(hwnd,9)
     app.focus_game(hwnd)
@@ -326,10 +323,10 @@ def _combat_step(preview_only=False,force_skill=None,context=None):
     def locate_reticle():
         def reselect():
             click(player)
-            if cooldown(capture(),2,read_turns=False)['blocked']:
+            if ai.cooldown(capture(),skill,read_turns=False)['blocked']:
                 raise TurnChanged('重选前二技能进入冷却，重新分析。')
-            click(SKILLS[2]);time.sleep(.4)
-        return wait_reticle(capture,reselect=reselect)
+            click(ai.skill_points[skill]);time.sleep(ai.aim_settle_seconds)
+        return ai.locate_aim(capture,reselect=reselect)
     def click(point):
         check()
         if not skill_panel_visible(capture()):
@@ -348,7 +345,7 @@ def _combat_step(preview_only=False,force_skill=None,context=None):
     if '放弃' not in phase: raise RuntimeError('未确认回合战斗界面，停止。')
     def recover_aim_turn():
         # Cancel the overlay and pass this turn only after both gunners/retries fail.
-        click(PLAYERS[0]);time.sleep(.2)
+        click(players[0]);time.sleep(.2)
         report={'released':False,'skipped':False,'action':'skip_turn',
                 'recovery':'aim_unavailable'}
         if context is not None: context['report']=report
@@ -364,7 +361,7 @@ def _combat_step(preview_only=False,force_skill=None,context=None):
     enemies=observe_enemies(image)
     if not enemies:
         # Cancel an old targeting overlay before taking a fresh observation.
-        click(PLAYERS[0])
+        click(players[0])
         deadline=time.monotonic()+6
         while not enemies:
             image=capture()
@@ -378,21 +375,24 @@ def _combat_step(preview_only=False,force_skill=None,context=None):
             time.sleep(.2)
     options=[]; states=[]; preferred=None; ready=None;aim_unavailable=False
     # Check skill 1 on both gunners first. Once it can hit, do not preview skill 2.
-    for skill in (1,2):
+    skill_order=list(dict.fromkeys(skill for policy in controllers.values() for skill in policy.skill_order))
+    for skill in skill_order:
         if force_skill is not None and skill!=force_skill: continue
-        for player in PLAYERS:
+        for player in players:
+            ai=controllers[player]
+            if skill not in ai.skill_order: continue
             click(player)
             selected=capture()
-            available=cooldown(selected,skill,read_turns=preview_only)
+            available=ai.cooldown(selected,skill,read_turns=preview_only)
             state=next((s for s in states if s['unit']==list(player)),None)
             if state is None:
-                state={'unit':list(player),'skills':{}};states.append(state)
+                state={'unit':list(player),'unit_id':ai.id,'skills':{}};states.append(state)
             state['skills'][skill]=available
             if available['blocked']: continue
-            click(SKILLS[skill])
-            targets=sweep_targets(enemies) if skill==2 else [tuple(enemies[0]['foot'])]
+            click(ai.skill_points[skill])
+            targets=ai.targets(enemies,skill)
             for index,target in enumerate(targets):
-                if skill==2:
+                if skill in ai.drag_skills:
                     try:
                         origin=locate_reticle()
                     except AimUnavailable:
@@ -403,12 +403,11 @@ def _combat_step(preview_only=False,force_skill=None,context=None):
                         mouse.drag((box[0]+origin[0],box[1]+origin[1]),
                                    (box[0]+target[0],box[1]+target[1]),check)
                 time.sleep(.25); preview=capture()
-                hits=skill_hits(preview,enemies,skill)
-                main=[h for h in hits if skill==1 or h['damage_band']=='main']
+                hits=ai.hits(preview,enemies,skill)
+                main,score=ai.evaluate(hits,skill)
                 full=len(main)
-                score=full+.2*(len(hits)-len(main))+sum(.1*(1-h['hp_fraction']) for h in main)
-                if skill==1 and hits: target=tuple(hits[0]['foot'])
-                option={'unit':list(player),'skill':skill,'target':list(target),
+                target=ai.confirmation_target(hits,skill,target)
+                option={'unit':list(player),'unit_id':ai.id,'skill':skill,'target':list(target),
                                 'hit_count':len(hits),'full_hits':full,'splash_hits':len(hits)-full,
                                 'score':round(score,3),'hits':hits}
                 options.append(option)
@@ -421,9 +420,10 @@ def _combat_step(preview_only=False,force_skill=None,context=None):
         if preferred: break
     viable=[option for option in options if option['hit_count']>0]
     if not viable:
-        if aim_unavailable: raise AimUnavailable('两个机枪手的二技能瞄准均未恢复，跳过本回合后重试。')
-        all_blocked=(force_skill is None and len(states)==len(PLAYERS) and
-                     all(all(s['skills'].get(k,{}).get('blocked',False) for k in (1,2)) for s in states))
+        if aim_unavailable: raise AimUnavailable('当前阵型可用单位的瞄准均未恢复，跳过本回合后重试。')
+        all_blocked=(force_skill is None and len(states)==len(players) and
+                     all(all(s['skills'].get(k,{}).get('blocked',False)
+                             for k in controllers[tuple(s['unit'])].skill_order) for s in states))
         if not all_blocked:
             raise RuntimeError('没有可靠的命中范围，停止；不将识别失败作为跳过回合的依据。')
         report={'enemies':enemies,'cooldowns':states,'options':options,
@@ -431,10 +431,11 @@ def _combat_step(preview_only=False,force_skill=None,context=None):
         if context is not None: context['report']=report
         if not preview_only:
             # Recheck both labels and all four cooldowns immediately before passing.
-            for player in PLAYERS:
+            for player in players:
+                ai=controllers[player]
                 click(player)
                 selected=capture()
-                if not all(cooldown(selected,k,read_turns=False)['blocked'] for k in (1,2)):
+                if not all(ai.cooldown(selected,k,read_turns=False)['blocked'] for k in ai.skill_order):
                     raise RuntimeError('跳过前发现技能已可用，停止本次跳过。')
             frame=capture()
             frame.crop((15,181,125,226)).resize((330,135)).save(path)
@@ -451,6 +452,7 @@ def _combat_step(preview_only=False,force_skill=None,context=None):
         (ROOT/'combat-result.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
         return report
     best=preferred or max(viable,key=lambda option:option['score'])
+    player=tuple(best['unit']);ai=controllers[player]
     report={'enemies':enemies,'cooldowns':states,'options':options,'chosen':best,
             'released':False,'strategy':'skill_1_first_then_front_of_highest_health_column',
             'model':'initial full health / health bars; skill 1 outlines; skill 2 blue main tiles + yellow splash tiles'}
@@ -459,18 +461,18 @@ def _combat_step(preview_only=False,force_skill=None,context=None):
         already_selected=ready==(best['unit'],best['skill'],best['target'])
         if not already_selected: click(best['unit'])
         selected=capture()
-        if cooldown(selected,best['skill'],read_turns=False)['blocked']: raise RuntimeError('释放前技能已进入冷却，停止。')
-        if not already_selected: click(SKILLS[best['skill']])
-        if best['skill']==2:
+        if ai.cooldown(selected,best['skill'],read_turns=False)['blocked']: raise RuntimeError('释放前技能已进入冷却，停止。')
+        if not already_selected: click(ai.skill_points[best['skill']])
+        if best['skill'] in ai.drag_skills:
             origin=locate_reticle()
             if origin!=tuple(best['target']):
                 mouse.drag((box[0]+origin[0],box[1]+origin[1]),
                            (box[0]+best['target'][0],box[1]+best['target'][1]),check)
         preview=capture(); preview.save(ROOT/'combat-chosen-preview.png')
-        if not skill_hits(preview,enemies,best['skill']): raise RuntimeError('释放前没有可靠的命中范围，停止。')
-        if best['skill']==2:
+        if not ai.hits(preview,enemies,best['skill']): raise RuntimeError('释放前没有可靠的命中范围，停止。')
+        if best['skill'] in ai.drag_skills:
             # The game needs time to settle the dragged marker before a full click.
-            time.sleep(.4)
+            time.sleep(ai.aim_settle_seconds)
             check()
             confirm=locate_reticle()
         else:
@@ -493,7 +495,7 @@ def _combat_step(preview_only=False,force_skill=None,context=None):
         report['after_health_bars']=health_bars(previous)
         # The next turn may select the other gunner. Its ready icon says nothing
         # about the skill just fired by the previous unit.
-        report['release_evidence']=release_evidence(previous,best['skill'],turn)
+        report['release_evidence']=release_evidence(previous,best['skill'],turn,policy=ai)
         report['release_confirmed']=bool(report['release_evidence'])
         if not report['release_confirmed']:
             # After a lethal shot the game can reset skill icons before showing
@@ -510,12 +512,13 @@ def _combat_step(preview_only=False,force_skill=None,context=None):
     (ROOT/'combat-result.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
     return report
 
-def release_evidence(image,skill,turn):
+def release_evidence(image,skill,turn,policy=None):
     if turn.get('battle_ended'): return 'settlement'
     if (turn.get('our_turn') and turn.get('opponent_ui_disappearance_seen')
             and turn.get('health_change_seen')):
         return 'turn_transition_and_health_change'
-    if cooldown(image,skill,read_turns=False)['blocked']: return 'cooldown'
+    reader=policy.cooldown if policy else cooldown
+    if reader(image,skill,read_turns=False)['blocked']: return 'cooldown'
     return None
 
 def combat_step(preview_only=False,force_skill=None):

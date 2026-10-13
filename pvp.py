@@ -9,6 +9,7 @@ import control
 import mouse_backend as mouse
 import deployment
 import combat
+from unit_ai import get as unit_ai
 from paths import ARTIFACTS,TEMPLATES
 
 ROOT=ARTIFACTS/'runtime'/'pvp'
@@ -264,11 +265,12 @@ def place_icon(capture,click,box,template):
     raise RuntimeError('点击单位后数量未改变，停止重复放置。')
 
 def deploy_team(capture,click,box):
+    gunner=unit_ai('heavy_gunner')
     image=capture()
     if stage(image)!='deployment': raise RuntimeError('未确认 PVP 部署界面。')
     if unit_count(image)[0]!=0: raise RuntimeError('本轮阵容要求空阵开始，停止追加。')
-    image=place_icon(capture,click,box,'heavy-gunner-icon.png')
-    players=[cell for cell in deployment.aircraft_cells() if deployment.gunner_present(image,cell)]
+    image=place_icon(capture,click,box,gunner.icon_template)
+    players=[cell for cell in deployment.aircraft_cells() if gunner.present(image,cell)]
     if not players: raise RuntimeError('已放下单位，但未定位机枪手。')
     cell=min(players,key=lambda p:abs(p[0]-599)+abs(p[1]-390))
     for number in range(6):
@@ -312,6 +314,7 @@ def send_laugh(capture,click):
     return {'sent':False,'name':'laugh','reason':'not_located','continue_deployment':True}
 
 def opening_sweep(capture,click,cell,timeout=90):
+    gunner=unit_ai('heavy_gunner');skill=gunner.pvp_opening_skill
     deadline=time.monotonic()+timeout
     last_saved=0;missing_since=None
     while time.monotonic()<deadline:
@@ -320,7 +323,7 @@ def opening_sweep(capture,click,cell,timeout=90):
             frame.save(ROOT/'opening-wait.png');last_saved=time.monotonic()
         if stage(frame) in ('defeat','victory'): return {'released':False,'battle_ended':True,'outcome':stage(frame)}
         if battle_started(frame):
-            if not deployment.gunner_present(frame,cell):
+            if not gunner.present(frame,cell):
                 if missing_since is None: missing_since=time.monotonic()
                 if time.monotonic()-missing_since>.8:
                     return {'released':False,'gunner_lost':True}
@@ -332,22 +335,22 @@ def opening_sweep(capture,click,cell,timeout=90):
                 time.sleep(.15);continue
             if not combat.skill_panel_visible(selected):
                 time.sleep(.12);continue
-            if combat.cooldown(selected,1,read_turns=False)['blocked']:
+            if gunner.cooldown(selected,skill,read_turns=False)['blocked']:
                 raise RuntimeError('PVP 第一次操作时一技能已冷却，未盲点。')
-            click(combat.SKILLS[1]);time.sleep(.4)
+            click(gunner.skill_points[skill]);time.sleep(gunner.aim_settle_seconds)
             preview=capture()
             if not battle_started(preview): continue
             # Skill 1 accepts any covered tile; fixed front-row middle avoids
             # requiring PVE sprite outlines for arbitrary PVP opponents.
-            target=[764,306];click(target)
+            target=list(gunner.pvp_opening_target);click(target)
             preview.save(ROOT/'opening-preview.png')
             deadline_release=time.monotonic()+1.2
             while time.monotonic()<deadline_release:
                 after=capture()
-                if not combat.skill_panel_visible(after) or combat.cooldown(after,1,read_turns=False)['blocked']:
-                    return {'released':True,'skill':1,'target':target}
+                if not combat.skill_panel_visible(after) or gunner.cooldown(after,skill,read_turns=False)['blocked']:
+                    return {'released':True,'skill':skill,'target':target}
                 time.sleep(.1)
-            return {'released':None,'clicked':True,'skill':1,'target':target,
+            return {'released':None,'clicked':True,'skill':skill,'target':target,
                     'confirmation':'transition_not_observed','continue_pass':True}
         time.sleep(.12)
     raise RuntimeError('等待 PVP 首次可操作回合超时。')

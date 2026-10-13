@@ -362,7 +362,10 @@ class App:
         self.scan.pack(side='left', fill='x', expand=True, padx=(0, 12))
         self.enter = ttk.Button(actions, text='识别并进入遭遇战', style='Action.TButton', command=lambda: self.run(True))
         self.enter.pack(side='left', fill='x', expand=True)
-        self.deploy_button = ttk.Button(self.root, text='布阵并开战：两名机枪手 + 后排飞机',
+        self.formation_button=ttk.Button(self.root,text='自定义布阵（5 / 5 / 3）',
+                                        command=self.open_formation)
+        self.formation_button.pack(fill='x',padx=26,pady=(0,8))
+        self.deploy_button = ttk.Button(self.root, text='按已保存阵型布阵并开战',
                                        style='Action.TButton', command=self.run_deployment)
         self.deploy_button.pack(fill='x', padx=26, pady=(0,16))
         self.combat_button = ttk.Button(self.root,text='分析并攻击一次（一、二技能）',
@@ -396,8 +399,15 @@ class App:
         self.status.insert('end', text)
         self.status.configure(state='disabled')
 
+    def open_formation(self):
+        from formation_ui import open_editor
+        def saved(config):
+            self.set_status(f"阵型已保存：{len(config['units'])} 个 AI 单位。")
+        open_editor(self.root,saved)
+
     def run(self, click):
         control.reset()
+        self.formation_button.configure(state='disabled')
         self.pvp_button.configure(state='disabled')
         self.auto_button.configure(state='disabled')
         self.settlement_button.configure(state='disabled')
@@ -418,6 +428,7 @@ class App:
 
     def run_deployment(self):
         control.reset()
+        self.formation_button.configure(state='disabled')
         self.pvp_button.configure(state='disabled')
         self.auto_button.configure(state='disabled')
         self.settlement_button.configure(state='disabled')
@@ -432,7 +443,7 @@ class App:
                 report=deploy_and_start()
                 result=report['placements']
                 self.messages.put('布阵检查完成，已点击开战，开战按钮已消失。\n'+
-                                  '\n'.join((f"机枪手第 {r['column']} 格：" if 'column' in r else '飞机后排第 2 格：')+
+                                  '\n'.join((f"{r.get('name','单位')} 第 {r.get('row',1)} 排第 {r.get('column',2)} 格：")+
                                             ('已在目标格' if r['status']=='already_placed' else '摆放完成') for r in result))
             except Exception as exc:
                 self.messages.put('布阵停止：'+str(exc))
@@ -475,7 +486,7 @@ class App:
         threading.Thread(target=worker,daemon=True).start()
 
     def action_buttons(self):
-        return (self.scan,self.enter,self.deploy_button,self.combat_button,self.settlement_button,self.auto_button,self.pvp_button)
+        return (self.scan,self.enter,self.formation_button,self.deploy_button,self.combat_button,self.settlement_button,self.auto_button,self.pvp_button)
 
     def run_pvp(self):
         control.reset()
@@ -524,6 +535,7 @@ class App:
             self.set_status(text)
             self.scan.configure(state='normal'); self.enter.configure(state='normal')
             self.deploy_button.configure(state='normal')
+            self.formation_button.configure(state='normal')
             self.combat_button.configure(state='normal')
             self.settlement_button.configure(state='normal')
             self.auto_button.configure(state='normal')
