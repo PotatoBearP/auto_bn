@@ -1,4 +1,4 @@
-# Battle Nations 遭遇战助手
+# 自动化助手
 
 双击 `启动工具.cmd` 打开 Python GUI。使用 Python 3.10、Tkinter、Pillow，以及 Windows 自带英语 OCR。当前电脑已具备这些组件。
 
