@@ -92,6 +92,12 @@ def locate_start_button(image):
     if '开战' not in text: raise RuntimeError('绿色按钮未通过“开战”文字核对，已停止。')
     return ((left+right)//2,(top+bottom)//2),(left,top,right,bottom),text
 
+
+def start_button_visible(image):
+    """Cheap observation only; locate_start_button still validates before input."""
+    colors=image.convert('RGB').crop((1190,460,1360,525)).getdata()
+    return sum(g>75 and g>r*1.5 and g>b*1.5 for r,g,b in colors)>1200
+
 def deploy_formation(config):
     """Place registered units in configured cells; discover their actual spawn cell."""
     import formation
@@ -151,7 +157,7 @@ def deploy_formation(config):
     (ROOT/'deployment-result.json').write_text(json.dumps(reports,ensure_ascii=False,indent=2),encoding='utf-8')
     return reports
 
-def start_battle(config=None):
+def start_battle(config=None,verify_placement=True):
     hwnd=app.find_game(); app.focus_game(hwnd)
     box=app.bounds(hwnd)
     if abs(box[2]-box[0]-1366)>2 or abs(box[3]-box[1]-768)>2:
@@ -159,8 +165,9 @@ def start_battle(config=None):
     image=ImageGrab.grab(bbox=box,all_screens=True)
     import formation
     config=formation.validate(config or formation.defaults())
-    for cell,ai in formation.units(config):
-        if not ai.present(image,cell): raise RuntimeError(f'{ai.name}在配置格 {cell} 未通过摆放检查，未开战。')
+    if verify_placement:
+        for cell,ai in formation.units(config):
+            if not ai.present(image,cell): raise RuntimeError(f'{ai.name}在配置格 {cell} 未通过摆放检查，未开战。')
     point,region,text=locate_start_button(image)
     image.save(ROOT/'start-before.png')
     if app.user32.GetForegroundWindow()!=hwnd or app.bounds(hwnd)!=box:

@@ -14,6 +14,25 @@ import deployment
 from paths import COMBAT,VALIDATION
 
 class WorkflowTests(unittest.TestCase):
+    def test_fast_attack_health_change_confirms_with_other_gunner_ready(self):
+        image=Image.new('RGB',(1366,768))
+        turn={'our_turn':True,'opponent_ui_disappearance_seen':False,'health_change_seen':True}
+        with patch.object(combat,'cooldown',return_value={'blocked':False}) as reader:
+            self.assertEqual(combat.release_evidence(image,1,turn),'settled_health_change')
+        reader.assert_not_called()
+
+    def test_returned_turn_confirms_even_without_health_scan(self):
+        image=Image.new('RGB',(1366,768))
+        turn={'our_turn':True,'opponent_ui_disappearance_seen':True,'health_change_seen':False}
+        with patch.object(combat,'cooldown',return_value={'blocked':False}) as reader:
+            self.assertEqual(combat.release_evidence(image,1,turn),'turn_transition')
+        reader.assert_not_called()
+
+    def test_health_change_before_stable_turn_does_not_confirm_ready_skill(self):
+        image=Image.new('RGB',(1366,768))
+        with patch.object(combat,'cooldown',return_value={'blocked':False}):
+            self.assertIsNone(combat.release_evidence(image,1,{'our_turn':False,'health_change_seen':True}))
+
     def test_attack_confirmed_when_next_turn_selects_other_ready_gunner(self):
         image=Image.new('RGB',(1366,768))
         turn={'our_turn':True,'opponent_ui_disappearance_seen':True,'health_change_seen':True}
@@ -50,13 +69,15 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(point,(765,195))
         self.assertEqual(len(retries),1)
 
-    def test_persistent_aim_failure_recovers_instead_of_stopping_combat(self):
-        recovered={'skipped':True,'skip_confirmed':True,'settled':True}
+    def test_persistent_aim_failure_requests_retry_without_skipping(self):
+        from unittest.mock import Mock
+        recovery=Mock()
         def step(preview,skill,context):
-            context['recover_aim_turn']=lambda:recovered
+            context['recover_aim_turn']=recovery
             raise combat.AimUnavailable('missing')
         with patch.object(combat,'_combat_step',side_effect=step):
-            self.assertEqual(combat.combat_step(),recovered)
+            with self.assertRaises(combat.CombatRetry): combat.combat_step()
+        recovery.assert_not_called()
 
     def test_visible_enemy_without_history_is_not_discarded(self):
         import json
@@ -70,6 +91,13 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual((enemies[0]['row'],enemies[0]['column']),(1,4))
         self.assertEqual(enemies[0]['hp_source'],'full_without_bar')
         self.assertEqual(enemies[0]['hp_fraction'],1.0)
+
+    def test_advanced_veteran_and_new_crew_remain_visible_under_targeting(self):
+        with Image.open(Path(__file__).parent/'assets/fixtures/coward-switch-targeting.png') as source:
+            image=source.convert('RGB')
+        enemies=combat.initial_enemies(image,tracked=[])
+        self.assertEqual({(e['sprite'],e['row'],e['column']) for e in enemies},
+                         {('veteran',1,1),('crew',3,3)})
 
     def test_missing_bar_means_full_even_with_old_damage_record(self):
         import json
@@ -157,7 +185,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(enemies[0]['column'],2)
         self.assertEqual(enemies[0]['hp_fraction'],0)
 
-    def run_case(self,step):
+    def run_case(self,step,max_actions=100,**battle_kwargs):
         with tempfile.TemporaryDirectory(dir=COMBAT) as directory,ExitStack() as stack:
             stack.enter_context(patch.object(automation,'COMBAT',Path(directory)))
             stack.enter_context(patch.object(control,'check'))
@@ -167,13 +195,15 @@ class WorkflowTests(unittest.TestCase):
                 stack.enter_context(patch.object(automation.app.user32,name,return_value=value))
             stack.enter_context(patch.object(automation.time,'sleep'))
             stack.enter_context(patch.object(automation.ImageGrab,'grab',return_value=Image.new('RGB',(1366,768),(0,200,0))))
-            stack.enter_context(patch.object(automation.settlement,'phase',side_effect=['map',None,'loot']))
+            stages=[None,'loot'] if battle_kwargs.get('start_current') else ['map',None,'loot']
+            stack.enter_context(patch.object(automation.settlement,'phase',side_effect=stages))
             entered=stack.enter_context(patch.object(automation.app,'encounter',return_value={'clicked':True}))
             deployed=stack.enter_context(patch.object(automation.deployment,'deploy_and_start',return_value={}))
-            action=stack.enter_context(patch.object(automation.combat,'combat_step',return_value=step))
+            action=stack.enter_context(patch.object(automation.combat,'combat_step',
+                **({'side_effect':step} if isinstance(step,list) else {'return_value':step})))
             finished=stack.enter_context(patch.object(automation.settlement,'finish_battle',return_value={'returned_to_map':True}))
             try:
-                result=automation.run_battle()
+                result=automation.run_battle(max_actions=max_actions,**battle_kwargs)
                 return result,entered.call_count,deployed.call_count,action.call_count,finished.call_count
             except RuntimeError:
                 return None,entered.call_count,deployed.call_count,action.call_count,finished.call_count
@@ -185,12 +215,52 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(result['status'],'complete')
         self.assertEqual(calls,[1,1,1,1])
 
-    def test_unconfirmed_release_stops_without_more_attacks_or_settlement(self):
+    def test_current_sweep_battle_never_searches_or_deploys(self):
+        result,*calls=self.run_case({'battle_ended':True},start_current=True,settlement_mode='repeat')
+        self.assertEqual(result['status'],'complete')
+        self.assertEqual(calls,[0,0,1,1])
+
+    def test_unconfirmed_release_retries_without_using_confirmed_action_limit(self):
         step={'released':True,'settled':True,'release_confirmed':False,
               'chosen':{'skill':2,'unit':[489,335],'target':[877,251],'hit_count':2}}
-        result,*calls=self.run_case(step)
+        result,*calls=self.run_case(step,max_actions=1)
+        self.assertEqual(result['status'],'complete')
+        self.assertEqual(calls,[1,1,2,1])
+
+    def test_recoverable_combat_failure_retries(self):
+        for failure in (combat.AimUnavailable('missing'),combat.CombatRetry('not ready'),
+                        combat.TurnChanged('animation')):
+            with self.subTest(failure=type(failure).__name__):
+                result,*calls=self.run_case([failure,{'battle_ended':True}],max_actions=1)
+                self.assertEqual(result['status'],'complete')
+                self.assertEqual(calls,[1,1,2,1])
+
+    def test_unsettled_turn_and_unconfirmed_skip_retry(self):
+        for step in ({'released':False}, {'skipped':True,'skip_confirmed':False},
+                     {'released':True,'release_confirmed':True,'settled':False,
+                      'chosen':{'skill':1,'unit':[489,335],'target':[877,251],'hit_count':1}}):
+            with self.subTest(step=step):
+                result,*calls=self.run_case([step,{'battle_ended':True}])
+                self.assertEqual(result['status'],'complete')
+                self.assertEqual(calls,[1,1,2,1])
+
+    def test_fatal_combat_error_still_stops(self):
+        result,*calls=self.run_case([RuntimeError('focus changed')])
         self.assertIsNone(result)
         self.assertEqual(calls,[1,1,1,0])
+
+    def test_turn_watchdog_resets_only_on_confirmed_next_turn_and_is_scoped(self):
+        import turn_watchdog
+        for flags,expected in (({'release_confirmed':True,'settled':True},1),
+                               ({'release_confirmed':False,'settled':True},0),
+                               ({'release_confirmed':True,'settled':False},0),
+                               ({'skipped':True,'skip_confirmed':True,'settled':True},1)):
+            with self.subTest(flags=flags),patch.object(turn_watchdog,'TurnWatchdog') as factory:
+                factory.return_value.incidents=[]
+                result,*_=self.run_case([flags,{'battle_ended':True}])
+                self.assertEqual(result['status'],'complete')
+                self.assertEqual(factory.return_value.progressed.call_count,expected)
+                self.assertIsNone(turn_watchdog.CURRENT.get())
 
     def test_stop_prevents_mouse_press(self):
         control.stop()
@@ -221,6 +291,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(turn['our_turn'])
         self.assertTrue(turn['health_change_seen'])
         self.assertFalse(turn['opponent_ui_disappearance_seen'])
+        with patch.object(combat,'cooldown',return_value={'blocked':False}):
+            self.assertEqual(combat.release_evidence(image,1,turn),'settled_health_change')
 
     def test_returning_ui_avoids_health_scans_and_long_waits(self):
         image=Image.new('RGB',(1366,768))

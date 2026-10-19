@@ -346,7 +346,7 @@ class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title('Battle Nations · 遭遇战助手')
-        self.root.geometry('660x870')
+        self.root.geometry('660x960')
         self.root.configure(bg='#161d28')
         self.messages = queue.Queue()
         style = ttk.Style()
@@ -371,6 +371,8 @@ class App:
         self.combat_button = ttk.Button(self.root,text='分析并攻击一次（一、二技能）',
                                         style='Action.TButton',command=self.run_combat)
         self.combat_button.pack(fill='x',padx=26,pady=(0,16))
+        ttk.Button(self.root,text='敌方阵容模型（5 / 5 / 3 文字视图）',
+                   command=self.open_battle_model).pack(fill='x',padx=26,pady=(0,10))
         self.settlement_button = ttk.Button(self.root,text='确认战利品和经验，返回大地图',
                                              style='Action.TButton',command=self.run_settlement)
         self.settlement_button.pack(fill='x',padx=26,pady=(0,16))
@@ -384,6 +386,12 @@ class App:
         self.pvp_button=ttk.Button(self.root,text='全自动 PVP 送分循环（哈哈笑 + 7 单位）',
                                    style='Action.TButton',command=self.run_pvp)
         self.pvp_button.pack(fill='x',padx=26,pady=(0,10))
+        sweep_actions=tk.Frame(self.root,bg='#161d28')
+        sweep_actions.pack(fill='x',padx=26,pady=(0,10))
+        self.sweep_formation_button=ttk.Button(sweep_actions,text='设置扫荡阵容',command=self.open_sweep_formation)
+        self.sweep_formation_button.pack(side='left',padx=(0,10))
+        self.sweep_button=ttk.Button(sweep_actions,text='自动扫荡（首场布阵，后续直接续战）',command=self.run_sweep)
+        self.sweep_button.pack(side='left',fill='x',expand=True)
         self.stop_button=ttk.Button(self.root,text='停止自动化（游戏中也可按 Esc）',
                                    command=self.stop_automatic,state='disabled')
         self.stop_button.pack(fill='x',padx=26,pady=(0,12))
@@ -405,8 +413,31 @@ class App:
             self.set_status(f"阵型已保存：{len(config['units'])} 个 AI 单位。")
         open_editor(self.root,saved)
 
+    def open_battle_model(self):
+        import sys
+        subprocess.Popen([sys.executable,str(ROOT/'battle_model.py')],cwd=str(ROOT))
+
+    def open_sweep_formation(self):
+        from formation_ui import open_editor
+        open_editor(self.root,lambda config:self.set_status(f"扫荡阵容已保存：{len(config['units'])} 个单位。"),sweep=True)
+
+    def run_sweep(self):
+        control.reset()
+        for button in self.action_buttons(): button.configure(state='disabled')
+        self.stop_button.configure(state='normal')
+        self.set_status('自动扫荡启动：首场布阵，结算后沿用阵容直接续战。按 Esc 停止。')
+        self.root.iconify()
+        def worker():
+            try:
+                from sweep import run_loop
+                run_loop(progress=lambda text:self.messages.put(('progress',text)))
+            except Exception as exc:
+                self.messages.put('自动扫荡已停止：'+str(exc))
+        threading.Thread(target=worker,daemon=True).start()
+
     def run(self, click):
         control.reset()
+        for button in self.action_buttons(): button.configure(state='disabled')
         self.formation_button.configure(state='disabled')
         self.pvp_button.configure(state='disabled')
         self.auto_button.configure(state='disabled')
@@ -428,6 +459,7 @@ class App:
 
     def run_deployment(self):
         control.reset()
+        for button in self.action_buttons(): button.configure(state='disabled')
         self.formation_button.configure(state='disabled')
         self.pvp_button.configure(state='disabled')
         self.auto_button.configure(state='disabled')
@@ -486,7 +518,8 @@ class App:
         threading.Thread(target=worker,daemon=True).start()
 
     def action_buttons(self):
-        return (self.scan,self.enter,self.formation_button,self.deploy_button,self.combat_button,self.settlement_button,self.auto_button,self.pvp_button)
+        return (self.scan,self.enter,self.formation_button,self.deploy_button,self.combat_button,
+                self.settlement_button,self.auto_button,self.pvp_button,self.sweep_button,self.sweep_formation_button)
 
     def run_pvp(self):
         control.reset()
@@ -533,6 +566,7 @@ class App:
                 return
             self.root.deiconify()
             self.set_status(text)
+            for button in self.action_buttons(): button.configure(state='normal')
             self.scan.configure(state='normal'); self.enter.configure(state='normal')
             self.deploy_button.configure(state='normal')
             self.formation_button.configure(state='normal')
@@ -554,6 +588,7 @@ if __name__ == '__main__':
     parser.add_argument('--auto',action='store_true')
     parser.add_argument('--scope',choices=('world','visible'),default='visible')
     parser.add_argument('--resume',action='store_true')
+    parser.add_argument('--sweep',action='store_true')
     args = parser.parse_args()
     if args.scan or args.enter:
         print(json.dumps(encounter(args.enter), ensure_ascii=False))
@@ -562,5 +597,6 @@ if __name__ == '__main__':
             close_existing_gui()
         instance=App()
         instance.scope_var.set('当前可见地图（不拖动）')
-        if args.auto: instance.root.after(300,lambda:instance.run_automatic(args.resume))
+        if args.sweep: instance.root.after(300,instance.run_sweep)
+        elif args.auto: instance.root.after(300,lambda:instance.run_automatic(args.resume))
         instance.root.mainloop()

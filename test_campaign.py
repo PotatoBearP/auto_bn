@@ -75,6 +75,9 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(ocr.call_count,3)
 
     def adapters(self,stack):
+        import formation
+        stack.enter_context(patch.object(formation,'active',return_value=formation.defaults()))
+        stack.enter_context(patch('battle_model.update'))
         stack.enter_context(patch.object(control,'check'))
         for name,value in [('find_game',1),('bounds',(0,0,1366,768))]:
             stack.enter_context(patch.object(campaign.app,name,return_value=value))
@@ -82,7 +85,7 @@ class CampaignTests(unittest.TestCase):
             stack.enter_context(patch.object(campaign.app.user32,name,return_value=value))
         stack.enter_context(patch.object(campaign.time,'sleep'))
 
-    def test_first_skill_skips_second_skill_preview(self):
+    def test_gunner_model_compares_skills_without_gui_preview(self):
         image=Image.open(VALIDATION/'skill-1-preview.png').convert('RGB')
         enemies=[b for b in combat.health_bars(image) if b['side']=='enemy']
         self.assertTrue(enemies)
@@ -91,13 +94,14 @@ class CampaignTests(unittest.TestCase):
             stack.enter_context(patch.object(combat,'ROOT',Path(directory)))
             stack.enter_context(patch.object(combat.ImageGrab,'grab',return_value=image))
             stack.enter_context(patch.object(combat,'wait_our_turn',return_value=(image,{'our_turn':True})))
-            stack.enter_context(patch.object(combat.app,'recognize',return_value=[{'Text':'放弃'}]))
+            ocr=stack.enter_context(patch.object(combat.app,'recognize',side_effect=AssertionError('Combat must not depend on button OCR')))
             stack.enter_context(patch.object(combat,'observe_enemies',return_value=enemies))
             stack.enter_context(patch.object(combat,'cooldown',return_value={'blocked':False,'turns':None}))
             click=stack.enter_context(patch.object(combat.mouse,'click'))
             reticle=stack.enter_context(patch.object(combat,'reticle_center'))
             result=combat.combat_step(preview_only=True)
-            self.assertEqual(result['chosen']['skill'],1)
+            ocr.assert_not_called()
+            self.assertEqual(result['chosen']['priority_key'],max(o['priority_key'] for o in result['planned_options']))
             self.assertEqual(len(result['options']),1)
             reticle.assert_not_called()
             self.assertNotIn(combat.SKILLS[2],[tuple(c.args) for c in click.call_args_list])
@@ -117,13 +121,13 @@ class CampaignTests(unittest.TestCase):
             stack.enter_context(patch.object(combat,'observe_enemies',return_value=enemies))
             stack.enter_context(patch.object(combat,'cooldown',side_effect=lambda frame,skill,**kw:{'blocked':skill==1}))
             stack.enter_context(patch.object(combat,'reticle_center',return_value=(544,196)))
-            hits=stack.enter_context(patch.object(combat,'skill_hits',return_value=[hit]))
+            hits=stack.enter_context(patch.object(combat.unit_ai('heavy_gunner'),'hits',return_value=[hit]))
             click=stack.enter_context(patch.object(combat.mouse,'click'))
             result=combat.combat_step(preview_only=True)
             self.assertEqual(result['chosen']['skill'],2)
             self.assertEqual(result['chosen']['unit'],list(combat.PLAYERS[0]))
             self.assertEqual(len(result['options']),1)
-            hits.assert_called_once()
+            hits.assert_not_called()
             # Second gunner is selected once for skill 1, never again for skill 2.
             self.assertEqual([c.args for c in click.call_args_list].count(combat.PLAYERS[1]),1)
 
@@ -172,6 +176,7 @@ class CampaignTests(unittest.TestCase):
             target={'X':538,'Y':358,'enemy':'感染者'}
             stack.enter_context(patch.object(campaign.app,'encounter',side_effect=[
                 {'candidates':1,'target':target},{'candidates':1,'target':target},
+                {'candidates':0,'clear':True},{'candidates':0,'clear':True},
                 {'candidates':0,'clear':True}]))
             battle=stack.enter_context(patch.object(campaign.automation,'run_battle',return_value={'actions':[{}]}))
             result=campaign.run_campaign(scope='visible')
@@ -189,7 +194,7 @@ class CampaignTests(unittest.TestCase):
             drag=stack.enter_context(patch.object(combat.mouse,'drag'))
             result=campaign.run_campaign(scope='world')
         self.assertEqual(result['scope'],'visible')
-        self.assertEqual(result['scanned_views'],1)
+        self.assertEqual(result['scanned_views'],3)
         self.assertEqual(result['status'],'complete')
         drag.assert_not_called()
 

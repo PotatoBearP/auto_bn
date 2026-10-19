@@ -8,6 +8,89 @@ from PIL import Image,ImageDraw
 import pvp
 
 class PvpTests(unittest.TestCase):
+    def test_shifted_defeat_dialog_and_narrow_confirm_are_recognized(self):
+        with Image.open(Path('artifacts/validation/pvp/defeat-shifted.png')) as source:
+            frame=source.convert('RGB')
+        outcome,point=pvp.result_dialog(frame)
+        self.assertEqual(outcome,'defeat')
+        self.assertLess(abs(point[0]-874),8)
+        self.assertLess(abs(point[1]-514),8)
+        self.assertEqual(pvp.stage(frame),'defeat')
+
+    def test_orange_button_alone_is_not_treated_as_result_dialog(self):
+        frame=Image.new('RGB',(1366,768))
+        ImageDraw.Draw(frame).rectangle((807,495,942,535),fill=(240,150,20))
+        self.assertEqual(pvp.result_dialog(frame),(None,None))
+
+    def test_failed_defeat_frame_confirms_then_waits_for_map(self):
+        with Image.open(Path('artifacts/validation/pvp/defeat-shifted.png')) as source:
+            defeated=source.convert('RGB')
+        base=Image.new('RGB',(1366,768));base.paste(pvp.reference('entry'),(791,679))
+        clock=[0.0];clicks=[]
+        def capture(): return base if clicks else defeated
+        with tempfile.TemporaryDirectory(dir=pvp.ROOT) as directory,ExitStack() as stack:
+            stack.enter_context(patch.object(pvp,'ROOT',Path(directory)))
+            stack.enter_context(patch.object(pvp.time,'monotonic',side_effect=lambda:clock[0]))
+            stack.enter_context(patch.object(pvp.time,'sleep',side_effect=lambda s:clock.__setitem__(0,clock[0]+s)))
+            result=pvp.finish_defeat(capture,clicks.append)
+        self.assertEqual(result['returned'],'map')
+        self.assertEqual(len(clicks),1)
+
+    def test_ranked_dialog_accepts_small_control_shift(self):
+        image=Image.new('RGB',(1366,768),(60,60,60))
+        for name in ('title','start'):
+            x,y,_,_=pvp.REGIONS[name]
+            image.paste(pvp.reference(name),(x-1,y+2))
+        self.assertEqual(pvp.stage(image),'ranked')
+        image.paste((60,60,60),(990,500,1120,585))
+        self.assertFalse(pvp.ranked_visible(image))
+
+    def test_base_entry_with_shift_and_changed_background_is_recognized(self):
+        with Image.open(Path('artifacts/validation/pvp/base-entry-shifted.png')) as image:
+            image=image.convert('RGB')
+        self.assertFalse(pvp.matches(image,'entry'))
+        self.assertTrue(pvp.entry_visible(image))
+        self.assertEqual(pvp.stage(image),'map')
+
+    def test_base_entry_requires_weapon_icon_and_letters_together(self):
+        image=Image.new('RGB',(1366,768),(120,120,120))
+        image.paste(pvp.reference('entry'),(790,679))
+        self.assertTrue(pvp.entry_visible(image))
+        image.paste((120,120,120),(790,679,871,744))
+        self.assertFalse(pvp.entry_visible(image))
+        self.assertIsNone(pvp.stage(image))
+
+    def test_start_waits_for_base_to_render_after_focus(self):
+        image=Image.new('RGB',(1366,768));clock=[0.0]
+        with patch.object(pvp,'stage',side_effect=[None,None,'map']), \
+             patch.object(pvp.time,'monotonic',side_effect=lambda:clock[0]), \
+             patch.object(pvp.time,'sleep',side_effect=lambda s:clock.__setitem__(0,clock[0]+s)), \
+             patch.object(pvp.mouse,'click') as click:
+            frame,current=pvp.wait_start_stage(lambda:image)
+        self.assertIs(frame,image)
+        self.assertEqual(current,'map')
+        self.assertAlmostEqual(clock[0],.3)
+        click.assert_not_called()
+
+    def test_start_timeout_saves_actual_unrecognized_frame(self):
+        image=Image.new('RGB',(1366,768));clock=[0.0]
+        with tempfile.TemporaryDirectory(dir=pvp.ROOT) as directory, \
+             patch.object(pvp,'ROOT',Path(directory)), \
+             patch.object(pvp,'stage',return_value=None), \
+             patch.object(pvp.time,'monotonic',side_effect=lambda:clock[0]), \
+             patch.object(pvp.time,'sleep',side_effect=lambda s:clock.__setitem__(0,clock[0]+s)), \
+             patch.object(pvp.mouse,'click') as click:
+            with self.assertRaises(RuntimeError): pvp.wait_start_stage(lambda:image,timeout=.3)
+            self.assertTrue((Path(directory)/'start-unrecognized.png').exists())
+        click.assert_not_called()
+
+    def test_base_wait_does_not_accept_active_battle(self):
+        image=Image.new('RGB',(1366,768))
+        with tempfile.TemporaryDirectory(dir=pvp.ROOT) as directory, \
+             patch.object(pvp,'ROOT',Path(directory)), \
+             patch.object(pvp,'stage',return_value='battle'):
+            with self.assertRaises(RuntimeError): pvp.wait_start_stage(lambda:image)
+
     def test_deployment_click_is_cancelled_when_opponent_surrenders(self):
         image=Image.new('RGB',(1366,768));clicks=[]
         with patch.object(pvp,'stage',return_value='victory'):
@@ -222,6 +305,16 @@ class PvpTests(unittest.TestCase):
         self.assertEqual(result['status'],'deployment')
         self.assertEqual(result['poll_interval'],4)
         self.assertEqual(result['observations'],[{'state':'matching'},{'state':'deployment'}])
+
+    def test_unaccepted_entry_click_is_retried_only_on_map(self):
+        result,clicks=self.run_flow(['map']*28+['ranked','ranked','battle'])
+        self.assertEqual(clicks,[(832,722),(832,722),(1054,541)])
+        self.assertEqual(result['entry_attempts'],2)
+
+    def test_entry_transition_to_existing_battle_does_not_click_start(self):
+        result,clicks=self.run_flow(['map','battle'])
+        self.assertEqual(clicks,[(832,722)])
+        self.assertEqual(result['status'],'battle')
 
     def test_fast_match_is_confirmed_in_battle(self):
         result,clicks=self.run_flow(['map','ranked','ranked','battle'])

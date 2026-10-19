@@ -12,9 +12,10 @@ REGIONS={
     'loot-title':(620,216,730,251), 'loot-confirm':(726,495,946,537),
     'experience-title':(620,232,732,274), 'experience-confirm':(726,474,946,516),
     'world-map-title':(1120,20,1295,67),
+    'sweep-loot-title':(620,216,730,251), 'sweep-loot-confirm':(806,495,946,537),
 }
 
-@lru_cache(maxsize=5)
+@lru_cache(maxsize=8)
 def reference_image(name):
     with Image.open(TEMPLATES/(name+'.png')) as image:
         return image.convert('RGB')
@@ -23,6 +24,36 @@ def matches(image,name):
     reference=reference_image(name)
     crop=image.crop(REGIONS[name]).convert('RGB')
     return sum(ImageStat.Stat(ImageChops.difference(crop,reference)).mean)/3<10
+
+@lru_cache(maxsize=1)
+def map_title_features():
+    reference=reference_image('world-map-title')
+    white=[];background=[]
+    for y in range(0,reference.height,2):
+        for x in range(0,reference.width,2):
+            r,g,b=reference.getpixel((x,y))
+            if min(r,g,b)>210 and max(r,g,b)-min(r,g,b)<30: white.append((x,y))
+            elif max(r,g,b)<145: background.append((x,y))
+    return white,background
+
+def map_visible(image):
+    if matches(image,'world-map-title'): return True
+    white,background=map_title_features()
+    if not white: return False
+    pixels=image.convert('RGB').load();left,top,right,bottom=REGIONS['world-map-title']
+    for dy in range(-12,13,2):
+        for dx in range(-12,13,2):
+            if left+dx<0 or top+dy<0 or right+dx>image.width or bottom+dy>image.height: continue
+            def is_white(x,y):
+                color=pixels[left+dx+x,top+dy+y]
+                return min(color)>190 and max(color)-min(color)<40
+            positive=sum(is_white(x,y) for x,y in white)/len(white)
+            if positive<.88: continue
+            # Require the spaces around the glyphs to remain dark, avoiding
+            # snowy map terrain or a uniformly white loading screen.
+            negative=sum(max(pixels[left+dx+x,top+dy+y])<180 for x,y in background)/max(1,len(background))
+            if negative>.85: return True
+    return False
 
 def locate_region(image,name,low,high):
     left,top,right,bottom=REGIONS[name]
@@ -50,6 +81,10 @@ def dialog(image):
         if title:
             button=locate_region(image,stage+'-confirm',360,650)
             if button: return stage,button
+    title=locate_region(image,'sweep-loot-title',100,400)
+    if title:
+        button=locate_region(image,'sweep-loot-confirm',360,650)
+        if button: return 'loot',button
     # A unit gaining XP can change the old "skill points" heading as well.
     button=locate_region(image,'experience-confirm',360,650)
     if button:
@@ -64,10 +99,10 @@ def dialog(image):
 def phase(image):
     stage,_=dialog(image)
     if stage: return stage
-    if matches(image,'world-map-title'): return 'map'
+    if map_visible(image): return 'map'
     return None
 
-def finish_battle():
+def finish_battle(next_battle=False):
     hwnd=app.find_game()
     if app.user32.IsIconic(hwnd): app.user32.ShowWindow(hwnd,9)
     app.focus_game(hwnd)
@@ -81,13 +116,33 @@ def finish_battle():
         return ImageGrab.grab(bbox=box,all_screens=True)
     clicked=[];deadline=time.monotonic()+30
     pending=None;attempts={};last_click=0;stable_stage=None;stable_since=0;map_since=None
+    battle_since=None
     while time.monotonic()<deadline:
         frame=capture();stage,button=dialog(frame)
         now=time.monotonic()
-        if stage is None and matches(frame,'world-map-title'): stage='map'
+        if stage is None and map_visible(frame): stage='map'
+        if next_battle:
+            from deployment import start_button_visible
+            retained_deployment=start_button_visible(frame) if stage is None else False
+            ready=(stage is None and 'loot' in clicked and
+                   (pending=='experience' or 'experience' in clicked) and
+                   retained_deployment)
+            if ready:
+                if battle_since is None: battle_since=now
+                if now-battle_since>=.35:
+                    if pending=='experience': clicked.append(pending)
+                    frame.save(COMBAT/'settlement-next-battle.png')
+                    result={'confirmed':clicked,'returned_to_map':False,
+                            'next_battle_ready':not retained_deployment,
+                            'next_deployment_ready':retained_deployment}
+                    (COMBAT/'settlement-result.json').write_text(json.dumps(result,indent=2),encoding='utf-8')
+                    return result
+            else: battle_since=None
         if pending and stage in ('loot','experience','map') and stage!=pending:
             clicked.append(pending);pending=None
         if stage=='map':
+            if next_battle:
+                raise RuntimeError('扫荡结算后返回了地图，未检测到下一场；未搜索或重新布阵。')
             if map_since is None: map_since=now
             if now-map_since<.35:
                 time.sleep(.08);continue

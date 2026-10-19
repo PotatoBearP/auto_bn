@@ -27,25 +27,31 @@ def run_campaign(progress=lambda text:None,scope='visible',resume_current=False)
             raise RuntimeError('窗口或焦点改变，连续清理已停止。')
         return ImageGrab.grab(bbox=box,all_screens=True)
     try:
-        if settlement.phase(capture())!='map':
-            if not resume_current: raise RuntimeError('请从世界地图开始连续清理。')
+        if resume_current:
             number=len(report['battles'])+1
             result=automation.run_battle(progress=lambda text:progress(f'第 {number} 场：{text}'),resume=True)
             report['battles'].append({'number':number,'attacks':len(result['actions']),
                                      'target':result['encounter']['target'],'returned_to_map':True})
             save()
+        empty_scans=0
         while True:
             control.check()
             progress(f"已完成 {len(report['battles'])} 场，正在检查地图 Attack 入口…")
             scan=app.encounter(False,allow_empty=True,first_only=True,entry_only=True)
             report['scanned_views']+=1;save()
             if scan['candidates']:
+                empty_scans=0
                 number=len(report['battles'])+1
                 result=automation.run_battle(
                     progress=lambda text:progress(f'第 {number} 场：{text}'),encounter_scan=scan)
                 report['battles'].append({'number':number,'attacks':len(result['actions']),
                                            'target':scan['target'],'returned_to_map':True})
                 save()
+                continue
+            empty_scans+=1
+            if empty_scans<3:
+                progress('本次未发现入口，等待地图刷新后再次扫描…')
+                time.sleep(.2)
                 continue
             break
         report.pop('no_infected_confirmed',None)

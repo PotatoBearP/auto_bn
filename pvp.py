@@ -11,6 +11,7 @@ import deployment
 import combat
 from unit_ai import get as unit_ai
 from paths import ARTIFACTS,TEMPLATES
+from recognition import retry_observation
 
 ROOT=ARTIFACTS/'runtime'/'pvp'
 ROOT.mkdir(parents=True,exist_ok=True)
@@ -22,7 +23,7 @@ class DeploymentSettled(RuntimeError):
 def deployment_io(capture,click):
     def guarded_capture():
         frame=capture();current=stage(frame)
-        if current in ('victory','defeat'): raise DeploymentSettled(current)
+        if current in ('victory','defeat','settlement'): raise DeploymentSettled(current)
         return frame
     def guarded_click(point):
         guarded_capture()
@@ -40,6 +41,23 @@ def reference(name):
 def matches(image,name):
     crop=image.crop(REGIONS[name]).convert('RGB')
     return sum(ImageStat.Stat(ImageChops.difference(crop,reference(name))).mean)/3<12
+
+
+def ranked_visible(image):
+    # Fixed dialog controls can shift by a few pixels with client sizing.
+    rgb=image.convert('RGB')
+    for name in ('title','start'):
+        left,top,right,bottom=REGIONS[name]
+        template=reference(name)
+        found=False
+        for dy in range(-4,5):
+            for dx in range(-4,5):
+                crop=rgb.crop((left+dx,top+dy,right+dx,bottom+dy))
+                if sum(ImageStat.Stat(ImageChops.difference(crop,template)).mean)/3<12:
+                    found=True;break
+            if found: break
+        if not found: return False
+    return True
 
 @lru_cache(maxsize=1)
 def matching_letters():
@@ -61,20 +79,83 @@ def entry_visible(image):
     marks=[(x,y) for y in range(65,84) for x in range(20,63)
            if min(template.getpixel((x,y)))>215]
     if not marks: return False
-    white=sum(min(pixels[791+x,679+y])>205 for x,y in marks)
-    green=sum(g>90 and g>r*1.3 and g>b*1.3
-              for r,g,b in image.crop((800,684,863,742)).convert('RGB').getdata())
-    return white/len(marks)>.8 and green>100
+    def green(color):
+        r,g,b=color
+        return g>90 and g>r*1.3 and g>b*1.3
+    icon=[(x,y) for y in range(5,63,2) for x in range(10,72,2)
+          if green(template.getpixel((x,y)))]
+    if not icon: return False
+    # Transparent button backgrounds vary; match the foreground at a shared
+    # offset so one-pixel UI shifts do not destroy the narrow letter mask.
+    for dy in range(-2,3):
+        for dx in range(-3,4):
+            white=sum(min(pixels[791+x+dx,679+y+dy])>190 for x,y in marks)
+            if white/len(marks)<.8: continue
+            matched=sum(green(pixels[791+x+dx,679+y+dy]) for x,y in icon)
+            if matched/len(icon)>.8: return True
+    return False
+
+def result_button(image):
+    pixels=image.convert('RGB').load();runs=[]
+    for y in range(430,min(620,image.height),2):
+        left=None
+        for x in range(700,min(990,image.width)):
+            r,g,b=pixels[x,y];orange=r>170 and 80<g<205 and b<120 and r-g>35
+            if orange and left is None: left=x
+            if left is not None and (not orange or x==min(990,image.width)-1):
+                if x-left>=60: runs.append((left,y,x))
+                left=None
+    groups=[]
+    for run in runs:
+        # White button lettering interrupts the orange run for up to 24 pixels.
+        if not groups or run[1]-groups[-1][-1][1]>28: groups.append([])
+        groups[-1].append(run)
+    groups=[group for group in groups if 16<=group[-1][1]-group[0][1]<=80]
+    if not groups: return None
+    group=max(groups,key=lambda group:sum(right-left for left,y,right in group))
+    left=min(x for x,y,right in group);right=max(right for x,y,right in group)
+    return ((left+right)//2,(group[0][1]+group[-1][1])//2)
+
+@lru_cache(maxsize=2)
+def result_title_mask(outcome):
+    title=reference(outcome)
+    return {(x,y) for y in range(0,title.height,2) for x in range(0,title.width,2)
+            if is_title_gold(title.getpixel((x,y)))}
+
+def is_title_gold(color):
+    r,g,b=color
+    return r>175 and g>100 and b<105 and r-g>25
+
+def result_dialog(image):
+    rgb=image.convert('RGB');pixels=rgb.load()
+    dark=sum(max(color)<120 and max(color)-min(color)<30
+             for color in rgb.crop((440,218,600,244)).getdata())
+    if dark<2500: return None,None
+    # Fast rejection keeps regular deployment/combat polling inexpensive.
+    title_gold=sum(is_title_gold(color) for color in rgb.crop((604,190,748,278)).getdata())
+    if title_gold<45: return None,None
+    best=(0,None)
+    for dy in range(-24,25):
+        for dx in range(-8,9):
+            actual={(x,y) for y in range(0,35,2) for x in range(0,110,2)
+                    if is_title_gold(pixels[620+dx+x,216+dy+y])}
+            if len(actual)<15: continue
+            for outcome in ('defeat','victory'):
+                expected=result_title_mask(outcome)
+                score=len(actual & expected)/max(1,len(actual | expected))
+                if score>best[0]: best=(score,outcome)
+    button=result_button(rgb)
+    if best[0]>.72: return best[1],button
+    # Shared result panel + orange confirmation are sufficient to settle even
+    # if font rendering makes the exact win/loss word temporarily ambiguous.
+    if button and dark>2500: return 'settlement',button
+    return None,None
 
 def stage(image,allow_deployment=False):
-    crop=image.crop(REGIONS['defeat']).convert('RGB')
-    actual=[r>180 and g>110 and b<90 for r,g,b in crop.getdata()]
-    for outcome in ('defeat','victory'):
-        expected=[r>180 and g>110 and b<90 for r,g,b in reference(outcome).getdata()]
-        union=sum(a or b for a,b in zip(actual,expected))
-        if union>50 and sum(a and b for a,b in zip(actual,expected))/union>.92: return outcome
+    outcome,_=result_dialog(image)
+    if outcome: return outcome
     if matching_banner(image): return 'matching'
-    if matches(image,'title') and matches(image,'start'): return 'ranked'
+    if ranked_visible(image): return 'ranked'
     if matches(image,'entry') or entry_visible(image): return 'map'
     timer=list(image.crop((628,2,738,63)).convert('RGB').getdata())
     timer_orange=sum(r>170 and 40<g<150 and b<75 and r>g*1.4 for r,g,b in timer)
@@ -82,11 +163,30 @@ def stage(image,allow_deployment=False):
     opponent=image.crop((1120,14,1285,40)).convert('RGB').getdata()
     opponent_gold=sum(r>200 and g>130 and b<100 for r,g,b in opponent)
     if max(timer_orange,timer_green)>250 and opponent_gold>20:
-        colors=image.crop((1200,450,1360,590)).convert('RGB').getdata()
-        if sum(g>100 and g>r*1.4 and g>b*1.4 for r,g,b in colors)>1500:
+        try:
+            start_button(image)
             return 'deployment'
+        except RuntimeError:
+            pass
         return 'battle'
     return None
+
+def wait_start_stage(capture,timeout=8,allow_started=False):
+    """Allow focus/return-to-base rendering to finish before rejecting entry."""
+    deadline=time.monotonic()+timeout
+    accepted=('map','ranked')
+    if allow_started: accepted+=('matching','deployment','battle','victory','defeat','settlement')
+    while True:
+        frame=capture();current=stage(frame)
+        if current in accepted: return frame,current
+        if current in ('matching','deployment','battle','victory','defeat','settlement'):
+            frame.save(ROOT/'start-unrecognized.png')
+            raise RuntimeError('当前仍在 PVP 对局或结算中，请返回基地后启动。')
+        if time.monotonic()>=deadline:
+            frame.save(ROOT/'start-unrecognized.png')
+            raise RuntimeError('等待 8 秒后仍未识别基地 PVP 入口，已保存 start-unrecognized.png。')
+        time.sleep(.15)
+
 
 def monitor_match(capture,progress=lambda text:None,timeout=300):
     deadline=time.monotonic()+timeout
@@ -103,7 +203,7 @@ def monitor_match(capture,progress=lambda text:None,timeout=300):
         progress({'matching':'PVP 正在寻找对局，4 秒后再次检查…',
                   'deployment':'PVP 已进入布置界面。','battle':'PVP 已进入战斗。'}.get(
                       current,'PVP 界面切换中，4 秒后再次检查…'))
-        if current in ('deployment','battle','defeat','victory'): return frame,current,observations
+        if current in ('deployment','battle','defeat','victory','settlement'): return frame,current,observations
         if current in ('map','ranked'):
             raise RuntimeError('PVP 匹配已返回地图或排位赛面板，未重复开战。')
         next_check=time.monotonic()+4
@@ -123,20 +223,38 @@ def start_match(progress=lambda text:None):
     def click(point):
         capture()
         mouse.click(box[0]+point[0],box[1]+point[1])
-    frame=capture();current=stage(frame)
+    frame,current=wait_start_stage(capture,allow_started=True)
     report={'clicked_pvp':False,'clicked_start':False}
-    if current in ('matching','deployment','battle','victory','defeat'):
+    if current in ('matching','deployment','battle','victory','defeat','settlement'):
         report.update(status=current,already_started=True)
     else:
         if current=='map':
             progress('正在打开 PVP 排位赛…')
             click((832,722));report['clicked_pvp']=True
             deadline=time.monotonic()+8
+            retry_at=time.monotonic()+2;entry_attempts=1
             while True:
                 frame=capture();current=stage(frame)
                 if current=='ranked': break
-                if time.monotonic()>=deadline: raise RuntimeError('等待 PVP 排位赛面板超时，未点击开战。')
+                if current in ('matching','deployment','battle','victory','defeat','settlement'):
+                    report.update(status=current,already_started=True)
+                    break
+                now=time.monotonic()
+                if now>=deadline:
+                    frame.save(ROOT/'ranked-unrecognized.png')
+                    raise RuntimeError('等待 PVP 排位赛面板超时，已保存 ranked-unrecognized.png，未点击开战。')
+                if current=='map' and entry_attempts<3 and now>=retry_at:
+                    # Retry only an entry still positively visible on the base.
+                    click((832,722));entry_attempts+=1;retry_at=now+2
                 time.sleep(.08)
+            report['entry_attempts']=entry_attempts
+        if current in ('matching','deployment','battle','victory','defeat','settlement'):
+            if current=='matching':
+                frame,current,observations=monitor_match(capture,progress)
+                report.update(status=current,observations=observations,poll_interval=4)
+            frame.save(ROOT/'after.png')
+            (ROOT/'result.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+            return report
         if current!='ranked': raise RuntimeError('未确认 PVP 入口或排位赛面板，未开始匹配。')
         if stage(capture())!='ranked': raise RuntimeError('PVP 面板改变，未点击开战。')
         frame.save(ROOT/'before.png')
@@ -145,7 +263,7 @@ def start_match(progress=lambda text:None):
         deadline=time.monotonic()+12
         while True:
             frame=capture();current=stage(frame,allow_deployment=True)
-            if current in ('matching','deployment','battle','defeat','victory'):
+            if current in ('matching','deployment','battle','defeat','victory','settlement'):
                 report['status']=current;break
             if time.monotonic()>=deadline:
                 frame.save(ROOT/'after.png')
@@ -170,12 +288,40 @@ def game_capture():
         capture();mouse.click(box[0]+point[0],box[1]+point[1])
     return capture,click,box
 
-def unit_count(image):
-    digit=image.crop((10,544,27,565)).convert('RGB')
+def visual_unit_count(image):
+    """Match foreground digit masks, independent of sand/lighting beneath them."""
+    def gold(color):
+        r,g,b=color
+        return r>180 and g>130 and b<100
+    scores=[]
     for count in (0,5):
         with Image.open(TEMPLATES/f'pvp-count-{count}.png') as source:
-            score=sum(ImageStat.Stat(ImageChops.difference(digit,source.convert('RGB'))).mean)/3
-        if score<10: return count,7
+            reference=source.convert('RGB')
+        expected=[gold(color) for color in reference.getdata()]
+        positive=[(i%reference.width,i//reference.width) for i,value in enumerate(expected) if value]
+        holes=[]
+        if count==0 and positive:
+            cx=(min(x for x,y in positive)+max(x for x,y in positive))//2
+            cy=(min(y for x,y in positive)+max(y for x,y in positive))//2
+            holes=[y*reference.width+x for y in range(cy-1,cy+2) for x in range(cx-1,cx+2)
+                   if not expected[y*reference.width+x]]
+        best=0
+        for y in range(541,549):
+            for x in range(7,15):
+                actual=[gold(color) for color in image.crop((x,y,x+reference.width,y+reference.height)).convert('RGB').getdata()]
+                if holes and sum(actual[i] for i in holes)/len(holes)>.25: continue
+                union=sum(a or b for a,b in zip(expected,actual))
+                score=sum(a and b for a,b in zip(expected,actual))/max(1,union)
+                best=max(best,score)
+        scores.append((best,count))
+    scores.sort(reverse=True)
+    if scores[0][0]>=.65 and scores[0][0]-scores[1][0]>=.12: return scores[0][1]
+    return None
+
+def unit_count(image):
+    count=visual_unit_count(image)
+    # Capacity is not needed to establish an empty board; don't guess 7 vs 8.
+    if count is not None: return count,None
     crop=image.crop((0,530,180,580)).convert('RGB')
     path=ROOT/'unit-count.png'
     mask=Image.new('L',crop.size)
@@ -189,6 +335,24 @@ def unit_count(image):
         count=re.search(r'([0-8])[/／]([0-8])',text)
     if not count: raise RuntimeError('未识别部署单位数量，未重复放置。')
     return int(count[1]),int(count[2])
+
+def read_unit_count(capture):
+    frame,count=retry_observation(capture,visual_unit_count,timeout=2)
+    if count is not None: return count,None
+    return unit_count(frame)
+
+def wait_deployment_frame(capture):
+    frame,state=retry_observation(capture,lambda image:'deployment' if stage(image)=='deployment' else None,timeout=3)
+    if state is None: raise RuntimeError('等待部署界面稳定后仍未确认，未添加单位。')
+    return frame
+
+def wait_start_button(capture):
+    def observe(image):
+        try: return start_button(image)
+        except RuntimeError: return None
+    _,result=retry_observation(capture,observe,timeout=3)
+    if result is None: raise RuntimeError('重试后仍未定位绿色开战按钮，未点击。')
+    return result
 
 def start_button(image):
     # Long horizontal green runs identify the rectangular button and exclude foliage.
@@ -214,7 +378,7 @@ def deploy_single(capture,click,box):
     if len(existing)==1:
         point,_=start_button(capture());click(point)
         return {'unit':'heavy_gunner','count':1,'cell':list(existing[0]),'clicked_start':True,'start_point':list(point),'resumed':True}
-    count,limit=unit_count(image)
+    count,limit=read_unit_count(capture)
     if count!=0: raise RuntimeError('PVP 布置不是空阵，停止追加单位。')
     for attempt in range(16):
         try:
@@ -258,7 +422,10 @@ def place_icon(capture,click,box,template):
     deadline=time.monotonic()+3
     while time.monotonic()<deadline:
         image=capture()
-        if stage(image)!='deployment': raise RuntimeError('部署阶段已结束，停止添加单位。')
+        current=stage(image)
+        if current is None:
+            time.sleep(.1);continue
+        if current!='deployment': raise RuntimeError('部署阶段已结束，停止添加单位。')
         if sum(a!=b for a,b in zip(before,count_marks(image)))>8:
             time.sleep(.2);return capture()
         time.sleep(.08)
@@ -266,17 +433,19 @@ def place_icon(capture,click,box,template):
 
 def deploy_team(capture,click,box):
     gunner=unit_ai('heavy_gunner')
-    image=capture()
-    if stage(image)!='deployment': raise RuntimeError('未确认 PVP 部署界面。')
-    if unit_count(image)[0]!=0: raise RuntimeError('本轮阵容要求空阵开始，停止追加。')
+    image=wait_deployment_frame(capture)
+    if read_unit_count(capture)[0]!=0: raise RuntimeError('本轮阵容要求空阵开始，停止追加。')
     image=place_icon(capture,click,box,gunner.icon_template)
-    players=[cell for cell in deployment.aircraft_cells() if gunner.present(image,cell)]
+    def find_players(frame):
+        players=[cell for cell in deployment.aircraft_cells() if gunner.present(frame,cell)]
+        return players or None
+    image,players=retry_observation(capture,find_players,timeout=3)
     if not players: raise RuntimeError('已放下单位，但未定位机枪手。')
     cell=min(players,key=lambda p:abs(p[0]-599)+abs(p[1]-390))
     for number in range(6):
         image=place_icon(capture,click,box,'bigfoot-baby-icon.png')
     image.save(ROOT/'deployment.png')
-    point,_=start_button(capture());click(point)
+    point,_=wait_start_button(capture);click(point)
     return {'unit':'heavy_gunner_and_bigfoot_babies','count':7,'babies':6,
             'cell':list(cell),'clicked_start':True,'start_point':list(point)}
 
@@ -321,7 +490,7 @@ def opening_sweep(capture,click,cell,timeout=90):
         frame=capture()
         if time.monotonic()-last_saved>.5:
             frame.save(ROOT/'opening-wait.png');last_saved=time.monotonic()
-        if stage(frame) in ('defeat','victory'): return {'released':False,'battle_ended':True,'outcome':stage(frame)}
+        if stage(frame) in ('defeat','victory','settlement'): return {'released':False,'battle_ended':True,'outcome':stage(frame)}
         if battle_started(frame):
             if not gunner.present(frame,cell):
                 if missing_since is None: missing_since=time.monotonic()
@@ -373,24 +542,34 @@ def our_turn(image):
     return sum(max(r,g,b)<85 for r,g,b in colors)>1800
 
 def finish_defeat(capture,click):
-    attempts=0;last_click=-10;deadline=time.monotonic()+30
+    attempts=0;last_click=-10;deadline=time.monotonic()+45
+    pending_point=None;stable_since=0;returned_since=None
     while time.monotonic()<deadline:
         frame=capture();current=stage(frame)
-        if current in ('map','ranked'): return {'returned':current,'confirm_attempts':attempts}
-        if current in ('defeat','victory') and time.monotonic()-last_click>=1.2:
-            if attempts>=3: raise RuntimeError('PVP 战败确定未切换界面，停止重复点击。')
-            if stage(capture()) not in ('defeat','victory'): continue
+        if current in ('map','ranked'):
+            if returned_since is None: returned_since=time.monotonic()
+            if time.monotonic()-returned_since>.35:
+                return {'returned':current,'confirm_attempts':attempts}
+            time.sleep(.1);continue
+        returned_since=None
+        if current in ('defeat','victory','settlement') and time.monotonic()-last_click>=1.2:
+            if attempts>=5: raise RuntimeError('PVP 结算确定五次后仍未切换，已停止。')
             frame.save(ROOT/'defeat.png')
-            pixels=frame.convert('RGB').load()
-            gold=[(x,y) for y in range(490,537,2) for x in range(715,951,2)
-                  if pixels[x,y][0]>180 and 90<pixels[x,y][1]<195 and pixels[x,y][2]<100]
-            if len(gold)<250: time.sleep(.1);continue
-            point=((min(x for x,y in gold)+max(x for x,y in gold))//2,
-                   (min(y for x,y in gold)+max(y for x,y in gold))//2)
+            point=result_button(frame)
+            if point is None: pending_point=None;time.sleep(.1);continue
+            if pending_point is None or abs(point[0]-pending_point[0])+abs(point[1]-pending_point[1])>8:
+                pending_point=point;stable_since=time.monotonic();time.sleep(.1);continue
+            if time.monotonic()-stable_since<.2: time.sleep(.1);continue
+            fresh=capture();fresh_outcome,fresh_point=result_dialog(fresh)
+            if fresh_outcome is None or fresh_point is None: time.sleep(.1);continue
+            if abs(point[0]-fresh_point[0])+abs(point[1]-fresh_point[1])>8:
+                pending_point=None;continue
+            point=fresh_point
             click(point)
             attempts+=1;last_click=time.monotonic()
         time.sleep(.1)
-    raise RuntimeError('PVP 战败确认后等待返回超时。')
+    frame.save(ROOT/'settlement-unrecognized.png')
+    raise RuntimeError('PVP 结算确认后等待返回超时，已保存 settlement-unrecognized.png。')
 
 def lose_battle(capture,click,progress=lambda text:None,timeout=300):
     deadline=time.monotonic()+timeout;passes=0;verified=False
@@ -400,10 +579,14 @@ def lose_battle(capture,click,progress=lambda text:None,timeout=300):
             control.check();time.sleep(min(.1,max(0,next_check-time.monotonic())))
         frame=capture();current=stage(frame)
         frame.save(ROOT/'after.png')
-        if current in ('defeat','victory'):
-            progress('PVP '+('战败' if current=='defeat' else '战胜（对手可能退出）')+'，正在确认…')
+        if current in ('defeat','victory','settlement'):
+            label={'defeat':'战败','victory':'战胜（对手可能退出）','settlement':'对局结束'}[current]
+            progress('PVP '+label+'，正在确认…')
             return {'passes':passes,'outcome':current,'settlement':finish_defeat(capture,click)}
-        if current in ('map','ranked'): raise RuntimeError('未观察到战败，PVP 已返回，停止本轮。')
+        if current in ('map','ranked'):
+            _,confirmed=retry_observation(capture,lambda image:stage(image) if stage(image) in ('map','ranked') else None,timeout=1)
+            if confirmed:
+                return {'passes':passes,'outcome':'unknown','settlement':{'returned':confirmed,'already_returned':True}}
         if battle_started(frame) and our_turn(frame):
             if our_turn(capture()):
                 click((70,203));passes+=1
@@ -413,7 +596,7 @@ def lose_battle(capture,click,progress=lambda text:None,timeout=300):
 
 def run_round(progress=lambda text:None):
     capture,click,box=game_capture()
-    if stage(capture()) in ('defeat','victory'):
+    if stage(capture()) in ('defeat','victory','settlement'):
         return {'status':'complete','resumed_defeat':True,'settlement':finish_defeat(capture,click)}
     report={'match':start_match(progress)}
     if report['match']['status']=='deployment':
@@ -444,8 +627,7 @@ def run_batch(rounds=5,progress=lambda text:None):
         for number in range(1,rounds+1):
             control.check()
             capture,_,_=game_capture()
-            if stage(capture()) not in ('map','ranked'):
-                raise RuntimeError('批量测试必须从基地或排位赛面板开始。')
+            wait_start_stage(capture)
             progress(f'PVP 连续测试 {number}/{rounds} 开始。')
             result=run_round(progress)
             report['rounds'].append(result);report['completed']=number
@@ -464,9 +646,12 @@ def run_loop(progress=lambda text:None):
     try:
         while True:
             control.check()
-            capture,_,_=game_capture()
-            if stage(capture()) not in ('map','ranked'):
-                raise RuntimeError('请从基地地图启动全自动 PVP。')
+            capture,click,_=game_capture()
+            _,current=wait_start_stage(capture,allow_started=True)
+            if current in ('victory','defeat','settlement'):
+                progress('检测到尚未确认的 PVP 结算，先确认返回基地…')
+                finish_defeat(capture,click)
+                continue
             number=report['completed']+1
             progress(f'全自动 PVP：第 {number} 轮开始。按 Esc 停止。')
             result=run_round(progress)

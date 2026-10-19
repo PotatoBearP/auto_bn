@@ -1,11 +1,16 @@
 """Registered unit controllers shared by deployment and combat."""
 from .heavy_gunner import HeavyGunnerAI
+from .coward import CowardAI
+from battle_rules import validate_models
 
-REGISTRY = {'heavy_gunner': HeavyGunnerAI()}
+REGISTRY = {'heavy_gunner': HeavyGunnerAI(),'coward':CowardAI()}
+for controller in REGISTRY.values(): validate_models(controller)
 
 def get(unit_id):
     try:
-        return REGISTRY[unit_id]
+        controller=REGISTRY[unit_id]
+        validate_models(controller)
+        return controller
     except KeyError:
         raise ValueError(f'未注册单位 AI：{unit_id}') from None
 

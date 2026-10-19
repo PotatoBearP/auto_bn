@@ -8,6 +8,8 @@ import app
 import mouse_backend as mouse
 import control
 import formation
+import target_priority
+import turn_watchdog
 from unit_ai import get as unit_ai
 from settlement import phase as settlement_phase
 
@@ -21,13 +23,16 @@ class BattleEnded(RuntimeError):
         self.image=image
         super().__init__('战斗已进入结算。')
 
-class TurnChanged(RuntimeError):
+class CombatRetry(RuntimeError):
+    """Transient combat observation failure; rebuild from a fresh frame."""
+
+class TurnChanged(CombatRetry):
     """An animation took over before input; rebuild the next turn's decision."""
 
-class AimUnavailable(RuntimeError):
+class AimUnavailable(CombatRetry):
     """Targeting failed while the turn and skill were still available."""
 
-def wait_reticle(capture,timeout=6,reselect=None):
+def wait_reticle(capture,timeout=6,reselect=None,skill=2,cooldown_reader=None):
     """Observe cooldown/turn changes, and recover a missing targeting overlay."""
     deadline=time.monotonic()+timeout
     retries=0
@@ -36,10 +41,11 @@ def wait_reticle(capture,timeout=6,reselect=None):
         if not skill_panel_visible(frame):
             _,turn=wait_our_turn(capture,timeout=25)
             if not turn.get('our_turn'):
-                raise RuntimeError('等待战斗动画及我方 UI 返回超时。')
+                raise CombatRetry('等待战斗动画及我方 UI 返回超时。')
             raise TurnChanged('已进入下一回合，需要重新分析技能。')
-        if cooldown(frame,2,read_turns=False)['blocked']:
-            raise TurnChanged('二技能已进入冷却，瞄准圈已消失，重新分析当前回合。')
+        reader=cooldown_reader or cooldown
+        if reader(frame,skill,read_turns=False)['blocked']:
+            raise TurnChanged(f'第 {skill} 技能已进入冷却，重新分析当前回合。')
         try:
             return reticle_center(frame)
         except RuntimeError:
@@ -49,32 +55,118 @@ def wait_reticle(capture,timeout=6,reselect=None):
                     reselect();retries+=1
                     deadline=time.monotonic()+4
                     continue
-                raise AimUnavailable('二技能瞄准中心暂未识别，已等待并重选技能。')
+                raise AimUnavailable(f'第 {skill} 技能瞄准中心暂未识别，已等待并重选技能。')
             time.sleep(.2)
 
 def reset_battle_state():
+    import battle_model
+    battle_model.reset()
     (ROOT/'battle-state.json').write_text('{"initial": true}',encoding='utf-8')
+    (ROOT/'ally-state.json').unlink(missing_ok=True)
 
-@lru_cache(maxsize=1)
-def enemy_templates():
+
+def observe_allies(image,controllers):
+    """Observe current survivors, without permanently marking an unseen unit dead."""
+    checked=any(getattr(ai,'check_survival',False) for ai in controllers.values())
+    bars=[bar for bar in health_bars(image) if bar['side']=='friendly'] if checked else []
+    available={};observations=[]
+    for point,ai in controllers.items():
+        requires_check=getattr(ai,'check_survival',False)
+        body=requires_check and ai.present(image,point)
+        selected=requires_check and ai.selected_at(image,point)
+        bar=next((bar for bar in bars if abs(bar['foot'][0]-point[0])<35 and
+                  abs(bar['foot'][1]-point[1])<15 and bar['hp_fraction']>0),None)
+        alive=not requires_check or body or selected or bar is not None
+        observations.append({'unit':list(point),'unit_id':ai.id,
+                             'status':'observed' if alive else 'unseen',
+                             'body_seen':bool(body),'selected_seen':bool(selected),
+                             'hp_fraction':bar['hp_fraction'] if bar is not None else None})
+        if alive: available[point]=ai
+    return available,observations
+
+
+def wait_selected_unit(capture,ai,player,attempts=10):
+    """A click is asynchronous: do not read the previous unit's skill panel."""
+    for _ in range(attempts):
+        frame=capture()
+        if not skill_panel_visible(frame):
+            raise TurnChanged('切换单位期间回合改变，重新建模。')
+        if not getattr(ai,'check_survival',False): return frame
+        if ai.selected_at(frame,player):
+            # The body highlight can precede the new skill panel by a frame.
+            time.sleep(.15)
+            frame=capture()
+            if not skill_panel_visible(frame):
+                raise TurnChanged('切换单位期间回合改变，重新建模。')
+            if ai.selected_at(frame,player): return frame
+        time.sleep(.12)
+    return None
+
+@lru_cache(maxsize=2)
+def enemy_templates(include_air=False):
     templates=[]
     for path in sorted(TEMPLATES.glob('enemy-*.png')):
+        if path.stem.split('-')[1]=='flyer' and not include_air: continue
         with Image.open(path) as reference:
             templates.append((path.stem.split('-')[1],reference.convert('RGB').resize((22,20))))
     return templates
 
-def initial_enemies(image,tracked=None):
+
+SHAPE_BOUNDS={'artillery':(-90,-130,90,25),'antiair':(-90,-150,90,20),
+              'veteran':(-50,-110,50,15),'armoredcar':(-60,-80,60,20),
+              'rocketteam':(-85,-100,85,65),'crew':(-45,-95,45,15)}
+
+
+@lru_cache(maxsize=8)
+def shape_template(name):
+    references=[]
+    for path in TEMPLATES.glob(f'shape-{name}*.png'):
+        with Image.open(path) as source:
+            references.append(source.convert('RGB').resize((36,34)))
+    return references
+
+
+def shape_matches(image,name,x,y):
+    if name not in SHAPE_BOUNDS: return True
+    left,top,right,bottom=SHAPE_BOUNDS[name]
+    sample=image.crop((x+left,y+top,x+right,y+bottom)).convert('RGB').resize((36,34))
+    colors=list(sample.getdata())
+    for reference in shape_template(name):
+        reference_colors=list(reference.getdata())
+        red_offsets=[i for i,(r,g,b) in enumerate(reference_colors) if r>120 and r>g*1.6 and r>b*1.6]
+        if red_offsets:
+            def nearby_red(index):
+                px=index%36;py=index//36
+                for sy in range(max(0,py-1),min(34,py+2)):
+                    for sx in range(max(0,px-1),min(36,px+2)):
+                        r,g,b=colors[sy*36+sx]
+                        if r>100 and r>g*1.4 and r>b*1.4: return True
+                return False
+            red_matches=sum(nearby_red(i) for i in red_offsets)
+            if red_matches<max(2,len(red_offsets)*.45): continue
+        offsets=[i for i,(r,g,b) in enumerate(reference_colors)
+                 if (r>120 and r>g*1.6 and r>b*1.6) or
+                    (r>160 and g>100 and b<100) or 20<max(r,g,b)<70]
+        if not offsets: continue
+        difference=sum(sum(abs(a-b) for a,b in zip(colors[i],reference_colors[i])) for i in offsets)/(3*len(offsets))
+        full_difference=sum(ImageStat.Stat(ImageChops.difference(sample,reference)).mean)/3
+        if difference<42 or full_difference<34: return True
+    return False
+
+def initial_enemies(image,tracked=None,include_air=False):
     """Recognize visible infected sprites on the calibrated board, not empty cells."""
-    templates=enemy_templates()
+    templates=enemy_templates(include_air)
     found=[]
     for row in (1,2,3):
         for column in (range(2,5) if row==3 else range(1,6)):
             x=544+110*(row+column-2); y=196+55*(column-row)
+            allowed={name:shape_matches(image,name,x,y) for name in {name for name,_ in templates}}
+            eligible=[(name,reference) for name,reference in templates if allowed[name]]
             best=(999,None,None)
             for dy in (-4,0,4):
                 for dx in (-4,0,4):
                     sample=image.crop((x+dx-22,y+dy-55,x+dx+22,y+dy-15)).convert('RGB').resize((22,20))
-                    for name,reference in templates:
+                    for name,reference in eligible:
                         score=sum(ImageStat.Stat(ImageChops.difference(sample,reference)).mean)/3
                         if score<best[0]: best=(score,name,[x+dx,y+dy])
             # Highlighted outlines and advancing poses alter the sprite crop.
@@ -116,7 +208,8 @@ def observe_enemies(image):
         enemies.append(enemy)
     if bars: state['initial']=False
     state.pop('known_health',None)
-    if enemies: state['last_enemies']=enemies
+    enemies=target_priority.annotate(enemies,previous,state)
+    state['last_enemies']=enemies
     path.write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8')
     return enemies
 
@@ -266,7 +359,8 @@ def outline_hits(image,enemies):
         for r,g,b in pixels:
             green+=g>210 and r<90 and b<150
             yellow+=r>210 and g>190 and b<90
-        if green>25 or yellow>45:
+        yellow_threshold=150 if enemy.get('sprite')=='antiair' else 45
+        if green>25 or yellow>yellow_threshold:
             hit.append({**enemy,'outline_green':green,'outline_yellow':yellow})
     return hit
 
@@ -301,222 +395,187 @@ def sweep_targets(enemies):
     return unit_ai('heavy_gunner').targets(enemies,2)
 
 def _combat_step(preview_only=False,force_skill=None,context=None):
+    """Observe -> pure model planning -> execute exactly one chosen action."""
+    from combat_planner import plan
+    from battle_rules import validate_models
     controllers=dict(formation.units())
-    players=list(controllers)
-    if not players: raise RuntimeError('阵型中没有可操作的 AI 单位。')
+    if not controllers: raise RuntimeError('阵型中没有可操作的 AI 单位。')
+    for ai in controllers.values(): validate_models(ai)
     hwnd=app.find_game()
     if app.user32.IsIconic(hwnd): app.user32.ShowWindow(hwnd,9)
-    app.focus_game(hwnd)
-    box=app.bounds(hwnd)
+    app.focus_game(hwnd);box=app.bounds(hwnd)
     if abs(box[2]-box[0]-1366)>2 or abs(box[3]-box[1]-768)>2:
-        raise RuntimeError('战斗识别暂适用于约 1366×768。')
+        raise RuntimeError('战斗识别适用于约 1366×768。')
+    metrics={'gui_range_scans':0,'skill_selections':0,'aim_drags':0,'unit_selections':0}
     def check():
         control.check()
         if app.user32.GetForegroundWindow()!=hwnd or app.bounds(hwnd)!=box:
             raise RuntimeError('窗口或焦点改变，已停止战斗操作。')
     def capture():
-        check()
-        frame=ImageGrab.grab(bbox=box,all_screens=True)
-        if settlement_phase(frame) in ('loot','experience'):
-            raise BattleEnded(frame)
+        check();frame=ImageGrab.grab(bbox=box,all_screens=True)
+        if settlement_phase(frame) in ('loot','experience'): raise BattleEnded(frame)
+        turn_watchdog.observe(frame)
         return frame
-    def locate_reticle():
-        def reselect():
-            click(player)
-            if ai.cooldown(capture(),skill,read_turns=False)['blocked']:
-                raise TurnChanged('重选前二技能进入冷却，重新分析。')
-            click(ai.skill_points[skill]);time.sleep(ai.aim_settle_seconds)
-        return ai.locate_aim(capture,reselect=reselect)
     def click(point):
-        check()
-        if not skill_panel_visible(capture()):
-            _,turn=wait_our_turn(capture)
-            if not turn.get('our_turn'): raise RuntimeError('等待我方 UI 返回超时。')
-            raise TurnChanged('输入前回合改变，重新分析。')
-        mouse.click(box[0]+point[0],box[1]+point[1]); time.sleep(.12)
+        frame=capture()
+        if not skill_panel_visible(frame): raise TurnChanged('回合动画进行中，等待后重新建模。')
+        mouse.click(box[0]+point[0],box[1]+point[1]);time.sleep(.12)
+    def select(player):
+        turn_watchdog.event('select_unit',{'selecting_unit':list(player)})
+        click(player);metrics['unit_selections']+=1
+        return wait_selected_unit(capture,controllers[player],player)
+    turn_watchdog.event('wait_our_turn')
     image,turn=wait_our_turn(capture)
-    if turn.get('battle_ended'):
-        return {'battle_ended':True,'released':False}
-    if not turn['our_turn']: raise RuntimeError('等待我方技能 UI 稳定超时，未攻击。')
+    if not turn['our_turn']: raise CombatRetry('等待我方回合稳定，未发送技能。')
+    configured=controllers
+    controllers,allies=observe_allies(image,configured)
+    if len(controllers)<len(configured):
+        time.sleep(.15);image=capture()
+        if not skill_panel_visible(image): raise TurnChanged('存活观察期间回合改变。')
+        controllers,allies=observe_allies(image,configured)
+    (ROOT/'ally-state.json').write_text(json.dumps(allies,ensure_ascii=False,indent=2),encoding='utf-8')
+    if not controllers: raise CombatRetry('暂未看到存活单位，等待结算或重新观察。')
     image.save(ROOT/'combat-before.png')
-    # The left button identifies combat and can pass a cooldown-only turn.
-    header=image.crop((15,181,125,226)).resize((330,135)); path=ROOT/'combat-phase.png'; header.save(path)
-    phase=''.join(w['Text'] for w in app.recognize(path,'zh-Hans-CN',True))
-    if '放弃' not in phase: raise RuntimeError('未确认回合战斗界面，停止。')
-    def recover_aim_turn():
-        # Cancel the overlay and pass this turn only after both gunners/retries fail.
-        click(players[0]);time.sleep(.2)
-        report={'released':False,'skipped':False,'action':'skip_turn',
-                'recovery':'aim_unavailable'}
-        if context is not None: context['report']=report
-        click((70,203));report['skipped']=True
-        frame,observation=wait_our_turn(capture,require_transition=True)
-        report.update(turn_observation=observation,settled=observation['our_turn'],
-                      battle_ended=observation.get('battle_ended',False),
-                      skip_confirmed=bool(observation.get('opponent_ui_disappearance_seen') and observation['our_turn']))
-        frame.save(ROOT/'combat-after.png')
-        (ROOT/'combat-result.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-        return report
-    if context is not None: context['recover_aim_turn']=recover_aim_turn
     enemies=observe_enemies(image)
     if not enemies:
-        # Cancel an old targeting overlay before taking a fresh observation.
-        click(players[0])
         deadline=time.monotonic()+6
-        while not enemies:
-            image=capture()
-            if not skill_panel_visible(image):
-                raise TurnChanged('敌人识别期间进入动画，重新等待回合。')
-            enemies=observe_enemies(image)
-            if enemies: break
-            if time.monotonic()>=deadline:
-                image.save(ROOT/'combat-unrecognized.png')
-                raise RuntimeError('等待动画并重新识别 6 秒后仍未定位敌人，已保存 combat-unrecognized.png。')
-            time.sleep(.2)
-    options=[]; states=[]; preferred=None; ready=None;aim_unavailable=False
-    # Check skill 1 on both gunners first. Once it can hit, do not preview skill 2.
-    skill_order=list(dict.fromkeys(skill for policy in controllers.values() for skill in policy.skill_order))
-    for skill in skill_order:
-        if force_skill is not None and skill!=force_skill: continue
-        for player in players:
-            ai=controllers[player]
-            if skill not in ai.skill_order: continue
-            click(player)
-            selected=capture()
-            available=ai.cooldown(selected,skill,read_turns=preview_only)
-            state=next((s for s in states if s['unit']==list(player)),None)
-            if state is None:
-                state={'unit':list(player),'unit_id':ai.id,'skills':{}};states.append(state)
-            state['skills'][skill]=available
-            if available['blocked']: continue
-            click(ai.skill_points[skill])
-            targets=ai.targets(enemies,skill)
-            for index,target in enumerate(targets):
-                if skill in ai.drag_skills:
-                    try:
-                        origin=locate_reticle()
-                    except AimUnavailable:
-                        aim_unavailable=True
-                        ready=None
-                        break # Try the other gunner instead of ending automation.
-                    if origin!=target:
-                        mouse.drag((box[0]+origin[0],box[1]+origin[1]),
-                                   (box[0]+target[0],box[1]+target[1]),check)
-                time.sleep(.25); preview=capture()
-                hits=ai.hits(preview,enemies,skill)
-                main,score=ai.evaluate(hits,skill)
-                full=len(main)
-                target=ai.confirmation_target(hits,skill,target)
-                option={'unit':list(player),'unit_id':ai.id,'skill':skill,'target':list(target),
-                                'hit_count':len(hits),'full_hits':full,'splash_hits':len(hits)-full,
-                                'score':round(score,3),'hits':hits}
-                options.append(option)
-                ready=(list(player),skill,list(target))
-                preview.save(ROOT/'combat-preview.png')
-                if hits:
-                    preferred=option
-                    break
-            if preferred: break
-        if preferred: break
-    viable=[option for option in options if option['hit_count']>0]
-    if not viable:
-        if aim_unavailable: raise AimUnavailable('当前阵型可用单位的瞄准均未恢复，跳过本回合后重试。')
-        all_blocked=(force_skill is None and len(states)==len(players) and
-                     all(all(s['skills'].get(k,{}).get('blocked',False)
-                             for k in controllers[tuple(s['unit'])].skill_order) for s in states))
-        if not all_blocked:
-            raise RuntimeError('没有可靠的命中范围，停止；不将识别失败作为跳过回合的依据。')
-        report={'enemies':enemies,'cooldowns':states,'options':options,
-                'action':'skip_turn','released':False,'skipped':False}
-        if context is not None: context['report']=report
+        while time.monotonic()<deadline and not enemies:
+            time.sleep(.2);image=capture();enemies=observe_enemies(image)
+        if not enemies: raise CombatRetry('敌方阵容暂未识别，等待后重新建模。')
+    priority_mode=target_priority.enabled(enemies)
+    if priority_mode and all(target_priority.level(e)==0 for e in enemies):
+        state_path=ROOT/'battle-state.json'
+        state=json.loads(state_path.read_text(encoding='utf-8')) if state_path.exists() else {}
+        if any(target_priority.level(e)>0 for e in state.get('missing_vehicles',[])):
+            deadline=time.monotonic()+3
+            while time.monotonic()<deadline:
+                time.sleep(.2);image=capture();fresh=observe_enemies(image)
+                if fresh: enemies=fresh
+                if any(target_priority.level(e)>0 for e in enemies): break
+    import battle_model
+    battle_model.update(image,enemies)
+    turn_watchdog.event('modeling',{'enemies':enemies,'allies':allies})
+    skills_for={player:(ai.available_skills(enemies) if hasattr(ai,'available_skills') else ai.skill_order)
+                for player,ai in controllers.items()}
+    started=time.perf_counter()
+    candidates=plan(controllers,enemies,skills_for,force_skill)
+    metrics['planning_ms']=round((time.perf_counter()-started)*1000,3)
+    metrics['modeled_candidates']=len(candidates)
+    report={'enemies':enemies,'allies':allies,'cooldowns':[],'options':[],
+            'planned_options':candidates,'planning_mode':'model_first','metrics':metrics,
+            'released':False,'decision_completed_before_skill_input':True,
+            'strategy':'threat_then_existing_strategy' if priority_mode else 'modeled_coverage_and_health',
+            'model':'declarative_553_skill_models'}
+    if context is not None: context['report']=report
+    turn_watchdog.event('select_action',{'current_combat_report':report})
+    checked={};unavailable=set();selected_player=None;chosen=None
+    for candidate in candidates:
+        player=tuple(candidate['unit']);ai=controllers[player];skill=candidate['skill']
+        if player in unavailable: continue
+        if player not in checked:
+            selected=select(player);selected_player=player
+            if selected is None:
+                unavailable.add(player);continue
+            checked[player]={k:ai.cooldown(selected,k,read_turns=False) for k in skills_for[player]}
+            report['cooldowns'].append({'unit':list(player),'unit_id':ai.id,'skills':checked[player]})
+        if checked[player][skill]['blocked']: continue
+        if selected_player!=player:
+            selected=select(player);selected_player=player
+            if selected is None: unavailable.add(player);continue
+        chosen=candidate;break
+    for ally in allies:
+        if tuple(ally['unit']) in unavailable: ally['status']='unselectable'
+    (ROOT/'ally-state.json').write_text(json.dumps(allies,ensure_ascii=False,indent=2),encoding='utf-8')
+    if chosen is None:
+        remaining=[p for p in controllers if p not in unavailable]
+        if not remaining: raise CombatRetry('单位暂不可选，重新读取存活阵容。')
+        # A lack of modeled reachable targets is not an instruction to pass.
+        blocked=(force_skill is None and all(p in checked and all(checked[p][k]['blocked']
+                    for k in skills_for[p]) for p in remaining))
+        if not blocked: raise CombatRetry('暂未找到可执行的建模方案，重新观察。')
+        report.update(action='skip_turn',skipped=False)
         if not preview_only:
-            # Recheck both labels and all four cooldowns immediately before passing.
-            for player in players:
+            for player in remaining:
+                frame=select(player)
+                if frame is None: raise CombatRetry('等待回合前单位状态改变，重新建模。')
                 ai=controllers[player]
-                click(player)
-                selected=capture()
-                if not all(ai.cooldown(selected,k,read_turns=False)['blocked'] for k in ai.skill_order):
-                    raise RuntimeError('跳过前发现技能已可用，停止本次跳过。')
-            frame=capture()
-            frame.crop((15,181,125,226)).resize((330,135)).save(path)
-            text=''.join(w['Text'] for w in app.recognize(path,'zh-Hans-CN',True))
-            if '放弃' not in text: raise RuntimeError('未确认左侧放弃按钮，未跳过回合。')
-            click((70,203))
-            report['skipped']=True
-            previous,turn=wait_our_turn(capture,require_transition=True)
-            previous.save(ROOT/'combat-after.png')
-            report['turn_observation']=turn
-            report['settled']=turn['our_turn']
-            report['battle_ended']=turn.get('battle_ended',False)
-            report['skip_confirmed']=bool(turn.get('opponent_ui_disappearance_seen') and turn['our_turn'])
+                if not all(ai.cooldown(frame,k,read_turns=False)['blocked'] for k in skills_for[player]):
+                    raise CombatRetry('技能已恢复，重新计算攻击。')
+            click((70,203));report['skipped']=True
+            after,turn=wait_our_turn(capture,require_transition=True)
+            report.update(settled=turn['our_turn'],turn_observation=turn,
+                          skip_confirmed=bool(turn['our_turn'] and turn.get('opponent_ui_disappearance_seen')))
+            if turn['our_turn']: battle_model.update(after,advance=True)
         (ROOT/'combat-result.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
         return report
-    best=preferred or max(viable,key=lambda option:option['score'])
-    player=tuple(best['unit']);ai=controllers[player]
-    report={'enemies':enemies,'cooldowns':states,'options':options,'chosen':best,
-            'released':False,'strategy':'skill_1_first_then_front_of_highest_health_column',
-            'model':'initial full health / health bars; skill 1 outlines; skill 2 blue main tiles + yellow splash tiles'}
-    if context is not None: context['report']=report
-    if not preview_only:
-        already_selected=ready==(best['unit'],best['skill'],best['target'])
-        if not already_selected: click(best['unit'])
-        selected=capture()
-        if ai.cooldown(selected,best['skill'],read_turns=False)['blocked']: raise RuntimeError('释放前技能已进入冷却，停止。')
-        if not already_selected: click(ai.skill_points[best['skill']])
-        if best['skill'] in ai.drag_skills:
-            origin=locate_reticle()
-            if origin!=tuple(best['target']):
-                mouse.drag((box[0]+origin[0],box[1]+origin[1]),
-                           (box[0]+best['target'][0],box[1]+best['target'][1]),check)
-        preview=capture(); preview.save(ROOT/'combat-chosen-preview.png')
-        if not ai.hits(preview,enemies,best['skill']): raise RuntimeError('释放前没有可靠的命中范围，停止。')
-        if best['skill'] in ai.drag_skills:
-            # The game needs time to settle the dragged marker before a full click.
-            time.sleep(ai.aim_settle_seconds)
-            check()
-            confirm=locate_reticle()
-        else:
-            confirm=best['target']
-        report['confirmation_center']=list(confirm)
-        before_signature=tuple((b['left'],b['top'],round(b['hp_fraction'],2)) for b in health_bars(capture()))
-        click(confirm) # Skill 2 must be confirmed at the actual blue ring center.
-        report['released']=True
-        state_path=ROOT/'battle-state.json'
-        state=json.loads(state_path.read_text(encoding='utf-8'))
-        state['initial']=False
-        state_path.write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8')
+    player=tuple(chosen['unit']);ai=controllers[player];skill=chosen['skill']
+    # This is state validation, never a range scan or candidate evaluation.
+    frame=capture()
+    if getattr(ai,'check_survival',False) and not ai.selected_at(frame,player):
+        raise CombatRetry('执行前单位状态改变，重新建模。')
+    if ai.cooldown(frame,skill,read_turns=False)['blocked']:
+        raise CombatRetry('执行前技能状态改变，重新建模。')
+    if priority_mode and chosen['priority_key'][0]==0:
+        fresh=observe_enemies(frame)
+        if target_priority.new_threat_before_cleanup(enemies,fresh):
+            raise CombatRetry('新乘员出现，重新计算威胁优先级。')
+    report['chosen']=chosen;report['options']=[chosen]
+    if preview_only:
         (ROOT/'combat-result.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-        # No further input until opponent UI disappearance and our panel's return.
-        previous,turn=wait_our_turn(capture,require_transition=True,before_signature=before_signature)
-        previous.save(ROOT/'combat-after.png')
-        report['turn_observation']=turn
-        report['settled']=turn['our_turn']
-        report['battle_ended']=turn.get('battle_ended',False)
-        report['after_health_bars']=health_bars(previous)
-        # The next turn may select the other gunner. Its ready icon says nothing
-        # about the skill just fired by the previous unit.
-        report['release_evidence']=release_evidence(previous,best['skill'],turn,policy=ai)
-        report['release_confirmed']=bool(report['release_evidence'])
-        if not report['release_confirmed']:
-            # After a lethal shot the game can reset skill icons before showing
-            # the victory dialog. Observe that transition without more input.
-            deadline=time.monotonic()+8
-            while time.monotonic()<deadline:
-                frame=capture()
-                if settlement_phase(frame) in ('loot','experience'):
-                    report['battle_ended']=True
-                    report['release_confirmed']=True
-                    frame.save(ROOT/'combat-after.png')
-                    break
-                time.sleep(.2)
+        return report
+    turn_watchdog.event('select_skill',{'chosen':chosen})
+    click(ai.skill_points[skill]);metrics['skill_selections']+=1
+    target=tuple(chosen['target'])
+    if chosen['aiming']=='drag':
+        turn_watchdog.event('aim_at_planned_target')
+        def reselect():
+            click(ai.skill_points[skill])
+        origin=ai.locate_aim(capture,reselect=reselect,skill=skill)
+        if abs(origin[0]-target[0])>3 or abs(origin[1]-target[1])>3:
+            mouse.drag((box[0]+origin[0],box[1]+origin[1]),
+                       (box[0]+target[0],box[1]+target[1]),check)
+            metrics['aim_drags']+=1
+        time.sleep(ai.aim_settle_seconds)
+        confirm=ai.locate_aim(capture,skill=skill)
+        if abs(confirm[0]-target[0])>20 or abs(confirm[1]-target[1])>15:
+            raise CombatRetry('瞄准圈未到达计算落点，重试执行。')
+    else:
+        time.sleep(ai.aim_settle_seconds);confirm=target
+    frame=capture()
+    if getattr(ai,'check_survival',False) and not ai.selected_at(frame,player):
+        raise CombatRetry('释放前单位状态改变，重新建模。')
+    before_signature=tuple((b['left'],b['top'],round(b['hp_fraction'],2)) for b in health_bars(frame))
+    frame.save(ROOT/'combat-chosen-preview.png')
+    report['confirmation_center']=list(confirm)
+    turn_watchdog.event('confirm_attack',{'confirmation_center':list(confirm)})
+    click(confirm);report['released']=True
+    path=ROOT/'battle-state.json'
+    state=json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+    state['initial']=False;path.write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8')
+    (ROOT/'combat-result.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+    turn_watchdog.event('wait_next_turn')
+    after,turn=wait_our_turn(capture,require_transition=True,before_signature=before_signature)
+    after.save(ROOT/'combat-after.png')
+    report.update(turn_observation=turn,settled=turn['our_turn'],
+                  battle_ended=turn.get('battle_ended',False),after_health_bars=health_bars(after))
+    report['release_evidence']=release_evidence(after,skill,turn,policy=ai)
+    report['release_confirmed']=bool(report['release_evidence'])
+    if turn['our_turn'] and report['release_confirmed']: battle_model.update(after,advance=True)
     (ROOT/'combat-result.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
     return report
 
+
 def release_evidence(image,skill,turn,policy=None):
     if turn.get('battle_ended'): return 'settlement'
-    if (turn.get('our_turn') and turn.get('opponent_ui_disappearance_seen')
-            and turn.get('health_change_seen')):
-        return 'turn_transition_and_health_change'
+    if turn.get('our_turn'):
+        transition=turn.get('opponent_ui_disappearance_seen')
+        health_change=turn.get('health_change_seen')
+        if transition and health_change: return 'turn_transition_and_health_change'
+        # wait_our_turn already requires the returning panel to settle, or a
+        # changed health signature to stay stable when a fast turn is missed.
+        # The next selected unit's ready icon cannot invalidate that evidence.
+        if transition: return 'turn_transition'
+        if health_change: return 'settled_health_change'
     reader=policy.cooldown if policy else cooldown
     if reader(image,skill,read_turns=False)['blocked']: return 'cooldown'
     return None
@@ -527,19 +586,11 @@ def combat_step(preview_only=False,force_skill=None):
         for attempt in range(4):
             try:
                 return _combat_step(preview_only,force_skill,context)
-            except AimUnavailable:
-                if preview_only or context.get('report',{}).get('released'): raise
-                recovery=context.get('recover_aim_turn')
-                if recovery is None: raise
-                try:
-                    return recovery()
-                except TurnChanged:
-                    context.clear()
             except TurnChanged:
                 # Never reuse old aim coordinates after a turn transition.
                 if context.get('report',{}).get('released'): raise
                 context.clear()
-        raise RuntimeError('连续四次分析时回合发生改变，停止输入。')
+        raise CombatRetry('连续四次分析时回合发生改变，等待后重新分析。')
     except BattleEnded as ended:
         ended.image.save(ROOT/'combat-after.png')
         report=context.get('report',{'released':False})

@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "units": [
+    {
+      "row": 1,
+      "column": 2,
+      "unit": "heavy_gunner"
+    },
+    {
+      "row": 1,
+      "column": 4,
+      "unit": "heavy_gunner"
+    }
+  ]
+}
