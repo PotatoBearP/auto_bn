@@ -131,6 +131,18 @@ class WorkflowTests(unittest.TestCase):
         enemies=combat.initial_enemies(image,tracked=[])
         self.assertTrue(all((e['row'],e['column']) in ((2,2),(2,3)) for e in enemies))
 
+    def test_victory_heading_with_known_confirm_is_loot(self):
+        image=Image.new('RGB',(1366,768))
+        image.paste(settlement.reference_image('loot-confirm'),(726,495))
+        with patch.object(settlement,'experience_title_text',return_value='战胜1恭喜你得'):
+            self.assertEqual(settlement.dialog(image),('loot',(726,495,946,537)))
+
+    def test_unknown_heading_does_not_authorize_confirm(self):
+        image=Image.new('RGB',(1366,768))
+        image.paste(settlement.reference_image('loot-confirm'),(726,495))
+        with patch.object(settlement,'experience_title_text',return_value='购买'):
+            self.assertEqual(settlement.dialog(image),(None,None))
+
     def test_experience_confirm_moves_with_taller_panel(self):
         image=Image.new('RGB',(1366,768),(110,110,110))
         image.paste(settlement.reference_image('experience-title'),(620,172))
@@ -138,6 +150,12 @@ class WorkflowTests(unittest.TestCase):
         stage,button=settlement.dialog(image)
         self.assertEqual(stage,'experience')
         self.assertEqual(button,(726,534,946,576))
+
+    def test_experience_blue_confirm_moves_with_panel(self):
+        image=Image.new('RGB',(1366,768))
+        image.paste(settlement.reference_image('experience-title'),(620,172))
+        image.paste(settlement.reference_image('experience-confirm-alt'),(726,534))
+        self.assertEqual(settlement.dialog(image),('experience',(726,534,946,576)))
 
     def test_settlement_retries_unaccepted_clicks_then_confirms_transition(self):
         clock=[0.0];stage=['loot'];clicks={'loot':0,'experience':0}

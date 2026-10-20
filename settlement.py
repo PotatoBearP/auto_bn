@@ -11,6 +11,7 @@ import control
 REGIONS={
     'loot-title':(620,216,730,251), 'loot-confirm':(726,495,946,537),
     'experience-title':(620,232,732,274), 'experience-confirm':(726,474,946,516),
+    'experience-confirm-alt':(726,474,946,516),
     'world-map-title':(1120,20,1295,67),
     'sweep-loot-title':(620,216,730,251), 'sweep-loot-confirm':(806,495,946,537),
 }
@@ -76,6 +77,10 @@ def experience_title_text(pixels,size):
     return ''.join(word['Text'] for word in app.recognize(path,'zh-Hans-CN',True))
 
 def dialog(image):
+    title=locate_region(image,'experience-title',100,400)
+    if title:
+        button=locate_region(image,'experience-confirm-alt',360,650)
+        if button: return 'experience',button
     for stage in ('loot','experience'):
         title=locate_region(image,stage+'-title',100,400)
         if title:
@@ -85,15 +90,21 @@ def dialog(image):
     if title:
         button=locate_region(image,'sweep-loot-confirm',360,650)
         if button: return 'loot',button
-    # A unit gaining XP can change the old "skill points" heading as well.
-    button=locate_region(image,'experience-confirm',360,650)
-    if button:
+    # Victory and XP headings vary; require a known confirm button plus OCR.
+    for stage in ('loot','experience'):
+        button=locate_region(image,stage+'-confirm',360,650)
+        if not button and stage=='experience':
+            button=locate_region(image,'experience-confirm-alt',360,650)
+        if not button: continue
         crop=image.crop((500,100,850,min(400,button[1]-50))).convert('RGB')
         mask=Image.new('L',crop.size)
         mask.putdata([0 if r>180 and g>100 and b<100 and r>g*1.05 else 255
                       for r,g,b in crop.getdata()])
         text=experience_title_text(mask.tobytes(),mask.size)
-        if '经验' in text or '技能点数' in text: return 'experience',button
+        if stage=='loot' and any(title in text for title in ('战胜','胜利','战利品')):
+            return stage,button
+        if stage=='experience' and ('经验' in text or '技能点数' in text):
+            return stage,button
     return None,None
 
 def phase(image):
