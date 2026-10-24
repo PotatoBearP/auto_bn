@@ -57,7 +57,7 @@ def close_existing_gui():
     def visit(hwnd, _):
         title = ctypes.create_unicode_buffer(512)
         user32.GetWindowTextW(hwnd, title, len(title))
-        if title.value == 'Battle Nations · 遭遇战助手':
+        if title.value in ('Battle Nations · 遭遇战助手','Battle Nations · 自动战斗工具'):
             user32.PostMessageW(hwnd, 0x0010, 0, 0)
         return True
     callback = callback_type(visit)
@@ -345,16 +345,16 @@ def encounter(click=False,allow_empty=False,target=None,first_only=False,entry_o
 class App:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title('Battle Nations · 遭遇战助手')
+        self.root.title('Battle Nations · 自动战斗工具')
         self.root.geometry('660x960')
         self.root.configure(bg='#161d28')
         self.messages = queue.Queue()
         style = ttk.Style()
         style.theme_use('clam')
         style.configure('Action.TButton', font=('Microsoft YaHei UI', 11), padding=12)
-        tk.Label(self.root, text='遭遇战助手', font=('Microsoft YaHei UI', 23, 'bold'),
+        tk.Label(self.root, text='自动战斗工具', font=('Microsoft YaHei UI', 23, 'bold'),
                  fg='#edf4ff', bg='#161d28').pack(anchor='w', padx=26, pady=(25, 10))
-        tk.Label(self.root, text='识别感染者卡片中的 Attack，进入感染者遭遇战。',
+        tk.Label(self.root, text='遭遇战 / PVP / 扫荡 / 消耗战，游戏中按 Esc 停止。',
                  font=('Microsoft YaHei UI', 11), fg='#aebdd0', bg='#161d28').pack(anchor='w', padx=26)
         actions = tk.Frame(self.root, bg='#161d28')
         actions.pack(fill='x', padx=26, pady=25)
@@ -392,13 +392,21 @@ class App:
         self.sweep_formation_button.pack(side='left',padx=(0,10))
         self.sweep_button=ttk.Button(sweep_actions,text='自动扫荡（首场布阵，后续直接续战）',command=self.run_sweep)
         self.sweep_button.pack(side='left',fill='x',expand=True)
+        attrition_actions=tk.Frame(self.root,bg='#161d28')
+        attrition_actions.pack(fill='x',padx=26,pady=(0,10))
+        self.attrition_button=ttk.Button(attrition_actions,text='自动消耗战（1 / 3 / 5 胆小鬼）',command=self.run_attrition)
+        self.attrition_button.pack(side='left',fill='x',expand=True,padx=(0,8))
+        tk.Label(attrition_actions,text='轮数（0 连续）',fg='#aebdd0',bg='#161d28').pack(side='left')
+        self.attrition_rounds=tk.StringVar(value='5')
+        self.attrition_count=ttk.Spinbox(attrition_actions,from_=0,to=999,width=5,textvariable=self.attrition_rounds)
+        self.attrition_count.pack(side='left',padx=(8,0))
         self.stop_button=ttk.Button(self.root,text='停止自动化（游戏中也可按 Esc）',
                                    command=self.stop_automatic,state='disabled')
         self.stop_button.pack(fill='x',padx=26,pady=(0,12))
         self.status = tk.Text(self.root, height=8, bg='#0e141e', fg='#c5d9ed', relief='flat',
                               font=('Microsoft YaHei UI', 10), padx=14, pady=12, wrap='word')
         self.status.pack(fill='both', expand=True, padx=26, pady=(0, 24))
-        self.set_status('就绪。请让感染者卡片可见。\n核对“感染者”和 Attack，多个匹配时选择最靠上方的一个。')
+        self.set_status('就绪。消耗战轮数默认 5，0 为持续循环。\n残血先出手，最大化命中人数，同人数优先红色高价值目标。\n两个及以上人形飞行怪在开战后重开。')
         self.root.after(100, self.poll)
 
     def set_status(self, text):
@@ -420,6 +428,28 @@ class App:
     def open_sweep_formation(self):
         from formation_ui import open_editor
         open_editor(self.root,lambda config:self.set_status(f"扫荡阵容已保存：{len(config['units'])} 个单位。"),sweep=True)
+
+    def run_attrition(self):
+        try:
+            rounds=int(self.attrition_rounds.get())
+            if rounds<0: raise ValueError()
+        except ValueError:
+            self.set_status('消耗战轮数必须是非负整数；0 表示持续循环。')
+            return
+        control.reset()
+        for button in self.action_buttons(): button.configure(state='disabled')
+        self.stop_button.configure(state='normal')
+        self.set_status(f'消耗战：{"持续循环" if rounds==0 else str(rounds)+" 轮测试"}，残血先出手，人数优先、同人数优先红怪。Esc 停止。')
+        self.root.iconify()
+        def worker():
+            try:
+                from attrition import run_loop
+                report=run_loop(progress=lambda text:self.messages.put(('progress',text)),max_battles=rounds or None)
+                rerolls=sum(len(check['rerolls']) for check in report.get('opening_checks',[]))
+                self.messages.put(f"消耗战完成：{len(report['battles'])} 轮，开局重开 {rerolls} 次。\n下一场已开战，自动操作已停止。")
+            except Exception as exc:
+                self.messages.put('自动消耗战已停止：'+str(exc))
+        threading.Thread(target=worker,daemon=True).start()
 
     def run_sweep(self):
         control.reset()
@@ -519,7 +549,7 @@ class App:
 
     def action_buttons(self):
         return (self.scan,self.enter,self.formation_button,self.deploy_button,self.combat_button,
-                self.settlement_button,self.auto_button,self.pvp_button,self.sweep_button,self.sweep_formation_button)
+                self.settlement_button,self.auto_button,self.pvp_button,self.sweep_button,self.sweep_formation_button,self.attrition_button,self.attrition_count)
 
     def run_pvp(self):
         control.reset()
@@ -589,6 +619,8 @@ if __name__ == '__main__':
     parser.add_argument('--scope',choices=('world','visible'),default='visible')
     parser.add_argument('--resume',action='store_true')
     parser.add_argument('--sweep',action='store_true')
+    parser.add_argument('--attrition',action='store_true')
+    parser.add_argument('--attrition-battles',type=int)
     args = parser.parse_args()
     if args.scan or args.enter:
         print(json.dumps(encounter(args.enter), ensure_ascii=False))
@@ -596,7 +628,10 @@ if __name__ == '__main__':
         if args.replace_gui:
             close_existing_gui()
         instance=App()
+        if args.attrition_battles is not None:
+            instance.attrition_rounds.set(str(args.attrition_battles))
         instance.scope_var.set('当前可见地图（不拖动）')
-        if args.sweep: instance.root.after(300,instance.run_sweep)
+        if args.attrition: instance.root.after(300,instance.run_attrition)
+        elif args.sweep: instance.root.after(300,instance.run_sweep)
         elif args.auto: instance.root.after(300,lambda:instance.run_automatic(args.resume))
         instance.root.mainloop()

@@ -1,4 +1,16 @@
-"""Threat ordering shared by recognition, previews and unit policies."""
+"""Threat ordering and an isolated attrition finishing policy."""
+from contextvars import ContextVar
+ATTRITION=ContextVar("attrition",default=False)
+ATTRITION_HIGH_VALUE=frozenset(('brute','wing'))
+
+
+def high_value(enemy):
+    """Recognized red brute/wing units, not arbitrary red outlines or rubble."""
+    return enemy.get('sprite') in ATTRITION_HIGH_VALUE
+
+def is_obstacle(enemy):
+    return enemy.get("is_obstacle",False) or enemy.get("kind")=="obstacle" or enemy.get("sprite") in ("obstacle","rock","barrier")
+
 HIGH=2
 LOW=1
 NONE=0
@@ -18,11 +30,18 @@ def level(enemy):
 
 
 def enabled(enemies):
-    return any(e.get('priority_mode') or e.get('sprite') in CATALOG for e in enemies)
+    return not ATTRITION.get() and any(e.get('priority_mode') or e.get('sprite') in CATALOG for e in enemies)
 
 
 def attack_key(hits,evaluate,active=True):
-    """No amount of lower-tier coverage outranks hitting a higher tier."""
+    """Attrition ranks coverage/value; ordinary battles rank threat tiers."""
+    if ATTRITION.get():
+        hits=[e for e in hits if not is_obstacle(e) and e.get('sprite')!='airflyer']
+        # Fractional HP is only a finishing heuristic, not calibrated damage.
+        wounded=[max(0.,min(1.,e.get('hp_fraction',1.))) for e in hits
+                 if e.get('hp_source')=='health_bar']
+        return (len(hits),sum(high_value(e) for e in hits),
+                sum(hp<=.3 for hp in wounded),sum(1-hp for hp in wounded))
     if not active: return (evaluate(hits),)
     highest=max((level(e) for e in hits),default=-1)
     return (highest,)+tuple(evaluate([e for e in hits if level(e)==tier])

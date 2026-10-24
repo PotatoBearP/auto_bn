@@ -1,5 +1,6 @@
 """Pure 5/5/3 geometry. Skill definitions are mandatory for every unit."""
 from dataclasses import dataclass
+from target_priority import is_obstacle
 
 CELLS=tuple((row,col) for row in (1,2,3)
             for col in (range(2,5) if row==3 else range(1,6)))
@@ -50,7 +51,7 @@ class SkillModel:
     def predict(self,enemies,anchor):
         main,splash=self.coverage(anchor);hits=[]
         for enemy in enemies:
-            if enemy.get('sprite') in self.excluded_types: continue
+            if is_obstacle(enemy) or enemy.get('sprite') in self.excluded_types: continue
             cell=enemy_cell(enemy)
             if cell in main or cell in splash:
                 hits.append({**enemy,'damage_band':'main' if cell in main else 'splash'})

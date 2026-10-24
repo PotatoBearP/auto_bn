@@ -195,6 +195,16 @@ def observe_enemies(image):
     previous=state.get('last_enemies',[])
     tracked=previous+state.get('initial_roster',[]) if not state.get('initial',False) else None
     visible=initial_enemies(image,tracked=tracked)
+    if target_priority.ATTRITION.get():
+        import attrition_vision
+        observed=attrition_vision.enemies(image,include_air=True)
+        ignored={(e['row'],e['column']) for e in observed if e['sprite']=='airflyer'}
+        visible=[e for e in observed if e['sprite']!='airflyer']
+        from battle_rules import CELLS,position
+        obstacles={cell for cell in CELLS if attrition_vision.obstacle_at(image,position(cell))}
+        state['ignored_obstacles']=[{'row':r,'column':c,'kind':'obstacle'} for r,c in sorted(obstacles)]
+        bars=[bar for bar in bars if (bar['row'],bar['column']) not in ignored and
+              (bar['row'],bar['column']) not in obstacles and not attrition_vision.obstacle_at(image,bar['foot'])]
     if state.get('initial',False) and visible: state['initial_roster']=visible
     enemies=bars[:]
     for enemy in visible:
@@ -208,7 +218,10 @@ def observe_enemies(image):
         enemies.append(enemy)
     if bars: state['initial']=False
     state.pop('known_health',None)
+    enemies=[e for e in enemies if not target_priority.is_obstacle(e)]
     enemies=target_priority.annotate(enemies,previous,state)
+    if target_priority.ATTRITION.get():
+        for enemy in enemies: enemy['high_value_target']=target_priority.high_value(enemy)
     state['last_enemies']=enemies
     path.write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8')
     return enemies
@@ -424,7 +437,29 @@ def _combat_step(preview_only=False,force_skill=None,context=None):
         turn_watchdog.event('select_unit',{'selecting_unit':list(player)})
         click(player);metrics['unit_selections']+=1
         return wait_selected_unit(capture,controllers[player],player)
+    def attrition_pass(reason,allies):
+        report={'released':False,'action':'skip_turn','reason':reason,
+                'skipped':False,'allies':allies}
+        if context is not None: context['report']=report
+        if not preview_only:
+            from pvp import pass_available
+            if not pass_available(capture()): raise CombatRetry('放弃按钮暂不可用，等待后重新检查。')
+            click((70,203));report['skipped']=True
+            after,turn=wait_our_turn(capture,require_transition=True)
+            report.update(settled=turn['our_turn'],turn_observation=turn,
+                          skip_confirmed=bool(turn['our_turn'] and turn.get('opponent_ui_disappearance_seen')))
+        (ROOT/'combat-result.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+        return report
     turn_watchdog.event('wait_our_turn')
+    if target_priority.ATTRITION.get():
+        frame=capture()
+        if not skill_panel_visible(frame):
+            # A selected coward's death can leave no panel at all. Selecting a
+            # freshly observed survivor restores it; waiting alone never will.
+            survivors,_=observe_allies(frame,controllers)
+            if survivors:
+                player=next(iter(survivors))
+                check();mouse.click(box[0]+player[0],box[1]+player[1]);time.sleep(.15)
     image,turn=wait_our_turn(capture)
     if not turn['our_turn']: raise CombatRetry('等待我方回合稳定，未发送技能。')
     configured=controllers
@@ -435,8 +470,25 @@ def _combat_step(preview_only=False,force_skill=None,context=None):
         controllers,allies=observe_allies(image,configured)
     (ROOT/'ally-state.json').write_text(json.dumps(allies,ensure_ascii=False,indent=2),encoding='utf-8')
     if not controllers: raise CombatRetry('暂未看到存活单位，等待结算或重新观察。')
+    ally_health={tuple(ally['unit']):ally['hp_fraction'] for ally in allies}
+    if target_priority.ATTRITION.get():
+        from combat_planner import health_fraction
+        controllers=dict(sorted(controllers.items(),key=lambda item:health_fraction(ally_health.get(item[0]))))
     image.save(ROOT/'combat-before.png')
+    if target_priority.ATTRITION.get() and force_skill is None:
+        no_skills=True
+        for player,ai in controllers.items():
+            selected=select(player)
+            if selected is None: raise CombatRetry('检查剩余技能时单位暂不可选。')
+            if any(not ai.cooldown(selected,k,read_turns=False)['blocked'] for k in ai.skill_order):
+                no_skills=False;break
+        if no_skills:
+            return attrition_pass('all_survivors_no_skills',allies)
     enemies=observe_enemies(image)
+    if not enemies and target_priority.ATTRITION.get():
+        import attrition_vision
+        if any(e['sprite']=='airflyer' for e in attrition_vision.enemies(image,include_air=True)):
+            return attrition_pass('only_untargetable_air_units',allies)
     if not enemies:
         deadline=time.monotonic()+6
         while time.monotonic()<deadline and not enemies:
@@ -458,13 +510,14 @@ def _combat_step(preview_only=False,force_skill=None,context=None):
     skills_for={player:(ai.available_skills(enemies) if hasattr(ai,'available_skills') else ai.skill_order)
                 for player,ai in controllers.items()}
     started=time.perf_counter()
-    candidates=plan(controllers,enemies,skills_for,force_skill)
+    candidates=plan(controllers,enemies,skills_for,force_skill,ally_health=ally_health)
     metrics['planning_ms']=round((time.perf_counter()-started)*1000,3)
     metrics['modeled_candidates']=len(candidates)
     report={'enemies':enemies,'allies':allies,'cooldowns':[],'options':[],
             'planned_options':candidates,'planning_mode':'model_first','metrics':metrics,
             'released':False,'decision_completed_before_skill_input':True,
-            'strategy':'threat_then_existing_strategy' if priority_mode else 'modeled_coverage_and_health',
+            'strategy':('wounded_coward_then_coverage_then_high_value_then_finishing' if target_priority.ATTRITION.get() else
+                        'threat_then_existing_strategy' if priority_mode else 'modeled_coverage_and_health'),
             'model':'declarative_553_skill_models'}
     if context is not None: context['report']=report
     turn_watchdog.event('select_action',{'current_combat_report':report})
@@ -492,7 +545,10 @@ def _combat_step(preview_only=False,force_skill=None,context=None):
         # A lack of modeled reachable targets is not an instruction to pass.
         blocked=(force_skill is None and all(p in checked and all(checked[p][k]['blocked']
                     for k in skills_for[p]) for p in remaining))
-        if not blocked: raise CombatRetry('暂未找到可执行的建模方案，重新观察。')
+        if not blocked:
+            if target_priority.ATTRITION.get() and not unavailable:
+                return attrition_pass('no_reachable_ready_skill',allies)
+            raise CombatRetry('暂未找到可执行的建模方案，重新观察。')
         report.update(action='skip_turn',skipped=False)
         if not preview_only:
             for player in remaining:

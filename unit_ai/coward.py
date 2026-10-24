@@ -26,8 +26,8 @@ class CowardAI:
     allowed_rows=(1,)
     check_survival=True
     skill_models={
-        1:SkillModel('drag','front',main=((0,0),(1,0),(2,0)),require_full=True),
-        2:SkillModel('drag','front',main=((0,-1),(0,0),(0,1)),require_full=True),
+        1:SkillModel('drag','front',main=((0,0),(1,0),(2,0)),require_full=True,excluded_types=('airflyer',)),
+        2:SkillModel('drag','front',main=((0,-1),(0,0),(0,1)),require_full=True,excluded_types=('airflyer',)),
     }
 
     def selected_at(self,image,cell):
@@ -60,7 +60,8 @@ class CowardAI:
 
     def predicted_hits(self,enemies,column,skill):
         cells=self.covered_cells(column,skill)
-        return [e for e in enemies if (e['row'],e['column']) in cells]
+        return [e for e in enemies if (e['row'],e['column']) in cells and
+                e.get('sprite') not in self.skill_models[skill].excluded_types and not target_priority.is_obstacle(e)]
 
     def targets(self,enemies,skill):
         active=target_priority.enabled(enemies)

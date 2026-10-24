@@ -7,6 +7,7 @@ import app
 import mouse_backend as mouse
 from paths import COMBAT, TEMPLATES
 import control
+from target_priority import ATTRITION
 
 REGIONS={
     'loot-title':(620,216,730,251), 'loot-confirm':(726,495,946,537),
@@ -14,6 +15,7 @@ REGIONS={
     'experience-confirm-alt':(726,474,946,516),
     'world-map-title':(1120,20,1295,67),
     'sweep-loot-title':(620,216,730,251), 'sweep-loot-confirm':(806,495,946,537),
+    'attrition-score-title':(610,195,750,234), 'attrition-score-confirm':(756,535,890,575),
 }
 
 @lru_cache(maxsize=8)
@@ -86,6 +88,16 @@ def dialog(image):
         if title:
             button=locate_region(image,stage+'-confirm',360,650)
             if button: return stage,button
+    if ATTRITION.get():
+        title=locate_region(image,'attrition-score-title',100,400)
+        if title:
+            button=locate_region(image,'attrition-score-confirm',400,650)
+            if button: return 'loot',button
+        from pvp import result_dialog
+        outcome,button=result_dialog(image)
+        if outcome and button:
+            x,y=button
+            return 'loot',(x-2,y-2,x+2,y+2)
     title=locate_region(image,'sweep-loot-title',100,400)
     if title:
         button=locate_region(image,'sweep-loot-confirm',360,650)
@@ -114,6 +126,9 @@ def phase(image):
     return None
 
 def finish_battle(next_battle=False):
+    if ATTRITION.get():
+        from attrition_settlement import finish_battle as finish_attrition
+        return finish_attrition(next_battle=next_battle)
     hwnd=app.find_game()
     if app.user32.IsIconic(hwnd): app.user32.ShowWindow(hwnd,9)
     app.focus_game(hwnd)
@@ -135,13 +150,12 @@ def finish_battle(next_battle=False):
         if next_battle:
             from deployment import start_button_visible
             retained_deployment=start_button_visible(frame) if stage is None else False
-            ready=(stage is None and 'loot' in clicked and
-                   (pending=='experience' or 'experience' in clicked) and
-                   retained_deployment)
+            ready=(stage is None and retained_deployment and 'loot' in clicked and
+                   (pending=='experience' or 'experience' in clicked))
             if ready:
                 if battle_since is None: battle_since=now
                 if now-battle_since>=.35:
-                    if pending=='experience': clicked.append(pending)
+                    if pending: clicked.append(pending)
                     frame.save(COMBAT/'settlement-next-battle.png')
                     result={'confirmed':clicked,'returned_to_map':False,
                             'next_battle_ready':not retained_deployment,

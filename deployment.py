@@ -80,6 +80,15 @@ def locate_start_button(image):
                 if x-start>=100: runs.append((start,y,x))
                 start=None
     if not runs: raise RuntimeError('未找到绿色开战按钮，已停止。')
+    # Keep separate green controls separate: a selected unit's HP bar below
+    # the start button must not pull the click into the space between them.
+    groups=[]
+    for run in runs:
+        if not groups or run[1]-groups[-1][-1][1]>28: groups.append([])
+        groups[-1].append(run)
+    groups=[group for group in groups if 18<=group[-1][1]-group[0][1]<=90]
+    if not groups: raise RuntimeError('绿色区域不符合开战按钮尺寸，已停止。')
+    runs=max(groups,key=lambda group:sum(right-left for left,y,right in group))
     left=min(r[0] for r in runs); right=max(r[2] for r in runs)
     top=min(r[1] for r in runs); bottom=max(r[1] for r in runs)
     crop=image.crop((left,max(0,top-5),right,min(image.height,bottom+6)))

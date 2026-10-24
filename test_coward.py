@@ -94,7 +94,7 @@ class CowardTests(unittest.TestCase):
             hits=self.ai.hits(image,[enemy(1,3),enemy(1,4),enemy(2,3)],2)
             self.assertEqual([(e['row'],e['column']) for e in hits],[(1,3),(1,4)])
 
-    def preview_case(self,enemies,controllers=None,living=None,selection=None,preview_only=True,blocked=None,mismatch=False):
+    def preview_case(self,enemies,controllers=None,living=None,selection=None,preview_only=True,blocked=None,mismatch=False,health=None):
         controllers=controllers or {((489,335)):self.ai}
         living=set(controllers) if living is None else set(living)
         image=Image.new('RGB',(1366,768));aim=[544,196];selected=[1]
@@ -127,7 +127,9 @@ class CowardTests(unittest.TestCase):
             stack.enter_context(patch.object(combat,'skill_panel_visible',return_value=True))
             stack.enter_context(patch.object(combat,'settlement_phase',return_value=None))
             stack.enter_context(patch.object(combat,'observe_enemies',return_value=enemies))
-            stack.enter_context(patch.object(combat,'health_bars',return_value=[]))
+            stack.enter_context(patch.object(combat,'health_bars',return_value=[
+                {'foot':list(point),'side':'friendly','hp_fraction':hp}
+                for point,hp in (health or {}).items() if hp is not None and point in living]))
             stack.enter_context(patch.object(self.ai,'present',side_effect=lambda frame,point:point in living))
             stack.enter_context(patch.object(self.ai,'selected_at',side_effect=lambda frame,point:
                 selection(point) if selection else point in living and point==selected_player[0]))

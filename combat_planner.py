@@ -1,9 +1,16 @@
 """Rank modeled actions without screenshots, mouse input, or cooldown guesses."""
 import target_priority
+import math
 from battle_rules import position,validate_models,enemy_cell
 
 
-def plan(controllers,enemies,skills_for,force_skill=None):
+def health_fraction(value):
+    """Unknown HP receives no wounded-unit priority."""
+    if not isinstance(value,(int,float)) or not math.isfinite(value): return 1.
+    return max(0.,min(1.,value))
+
+
+def plan(controllers,enemies,skills_for,force_skill=None,ally_health=None):
     active=target_priority.enabled(enemies)
     options=[]
     for player,ai in controllers.items():
@@ -26,4 +33,10 @@ def plan(controllers,enemies,skills_for,force_skill=None):
                                 'splash_hits':len(hits)-len(main),'score':round(score,3),
                                 'priority_key':target_priority.attack_key(hits,
                                     lambda subset:ai.evaluate(subset,skill)[1],active=active)})
-    return sorted(options,key=lambda option:option['priority_key'],reverse=True)
+    for option in options:
+        option['selection_key']=option['priority_key']
+        if target_priority.ATTRITION.get() and option['unit_id']=='coward':
+            hp=(ally_health or {}).get(tuple(option['unit']))
+            option['unit_hp_fraction']=hp
+            option['selection_key']=(-health_fraction(hp),)+option['priority_key']
+    return sorted(options,key=lambda option:option['selection_key'],reverse=True)
