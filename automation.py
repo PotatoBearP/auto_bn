@@ -41,6 +41,9 @@ def run_battle(progress=lambda message:None,max_actions=100,timeout=900,resume=F
         raise RuntimeError('等待布阵界面超时，未重复点击 Attack。')
     monitor=None;monitor_token=None
     try:
+        if resume and deployment.start_button_visible(capture()):
+            progress('接续尚未开战的布阵界面，核验阵型后开战…')
+            report['deployment']=deployment.deploy_and_start();save()
         if not resume and not start_current:
             progress('正在识别感染者并进入遭遇战…')
             if encounter_scan:

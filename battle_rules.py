@@ -26,9 +26,11 @@ class SkillModel:
     absolute: bool=False
     excluded_types: tuple=()
     require_full: bool=False
+    anchor_cells: tuple=()
 
     def legal_anchors(self,enemies):
-        if self.anchors=='front': anchors=tuple(cell for cell in CELLS if cell[0]==1)
+        if self.anchor_cells: anchors=tuple(cell for cell in self.anchor_cells if cell in CELLS)
+        elif self.anchors=='front': anchors=tuple(cell for cell in CELLS if cell[0]==1)
         elif self.anchors=='occupied':
             anchors=tuple(dict.fromkeys(enemy_cell(e) for e in enemies if enemy_cell(e) in CELLS and
                                        e.get('sprite') not in self.excluded_types and

@@ -11,14 +11,57 @@ import control
 from paths import COMBAT,VALIDATION
 
 class CampaignTests(unittest.TestCase):
-    def test_entry_scan_skips_mammoth_then_takes_first_other_card(self):
+    def test_occluded_title_can_use_exact_infected_portrait(self):
+        image=Image.new('RGB',(1366,768))
+        image.paste(campaign.app.infected_map_avatar(),(183,80))
+        self.assertTrue(campaign.app.infected_avatar_matches(image,{'X':300,'Y':120}))
+        image.paste(campaign.app.mammoth_avatar(),(183,80))
+        self.assertFalse(campaign.app.infected_avatar_matches(image,{'X':300,'Y':120}))
+        image.paste(campaign.app.pirate_map_avatar(),(183,80))
+        self.assertFalse(campaign.app.infected_avatar_matches(image,{'X':300,'Y':120}))
+
+    def test_portrait_fallback_handles_map_interpolation(self):
+        from paths import TEMPLATES
+        with Image.open(TEMPLATES/'regression-map-avatar-interpolation.png') as frame:
+            entries=campaign.app.infected_portrait_entries(frame)
+        self.assertEqual(len(entries),1)
+        self.assertLess(abs(entries[0]['X']-30),4)
+        self.assertLess(abs(entries[0]['Y']-29),4)
+
+    def test_minzoom_connected_card_buttons(self):
+        from paths import TEMPLATES
+        with Image.open(TEMPLATES/'regression-map-connected-cards.png') as frame:
+            buttons=campaign.app.minzoom_attack_buttons(frame)
+        self.assertTrue(any(abs(p['X']-128)<4 and abs(p['Y']-77)<4 for p in buttons))
+        self.assertTrue(any(abs(p['X']-288)<4 and abs(p['Y']-61)<4 for p in buttons))
+
+    def test_real_cooldown_overlay_with_non_red_corner(self):
+        from paths import TEMPLATES
+        image=Image.new('RGB',(1366,768))
+        with Image.open(TEMPLATES/'regression-cooldown-icons.png') as icons:
+            image.paste(icons,(277,699))
+        self.assertTrue(combat.cooldown(image,1,read_turns=False)['blocked'])
+        self.assertFalse(combat.cooldown(image,2,read_turns=False)['blocked'])
+
+    def test_pirate_and_mixed_titles_are_rejected(self):
+        with tempfile.TemporaryDirectory(dir=COMBAT) as directory,ExitStack() as stack:
+            stack.enter_context(patch.object(campaign.app,'ENCOUNTER',Path(directory)))
+            stack.enter_context(patch.object(campaign.app,'OCR',Path(directory)))
+            stack.enter_context(patch.object(campaign.app,'recognize',side_effect=[
+                [{'Text':'珊瑚礁海盗'}],[{'Text':'感染者狂热猛犸象'}]]))
+            found=campaign.app.infected_candidates(Image.new('RGB',(1366,768)),[
+                {'X':300,'Y':120},{'X':500,'Y':160}])
+        self.assertEqual(found,[])
+
+    def test_entry_scan_requires_infected_title(self):
         entries=[{'Text':'Attack!','X':300,'Y':120},{'Text':'Attack!','X':500,'Y':160}]
         with tempfile.TemporaryDirectory(dir=COMBAT) as directory,ExitStack() as stack:
             self.adapters(stack)
             stack.enter_context(patch.object(campaign.app,'ENCOUNTER',Path(directory)))
+            stack.enter_context(patch.object(campaign.app,'OCR',Path(directory)))
             stack.enter_context(patch.object(campaign.app.ImageGrab,'grab',return_value=Image.new('RGB',(1366,768))))
             stack.enter_context(patch.object(campaign.app,'iter_attack_buttons',return_value=iter(entries)))
-            stack.enter_context(patch.object(campaign.app,'mammoth_card',side_effect=[(True,'狂热猛犸象'),(False,'')]))
+            stack.enter_context(patch.object(campaign.app,'recognize',side_effect=[[{'Text':'狂热猛犸象'}],[{'Text':'感染者'}]]))
             result=campaign.app.encounter(allow_empty=True,entry_only=True)
         self.assertEqual(result['target']['X'],500)
 
@@ -30,19 +73,20 @@ class CampaignTests(unittest.TestCase):
         self.assertTrue(excluded)
         ocr.assert_not_called()
 
-    def test_clipped_attack_entry_needs_no_card_ocr_or_remaining_scan(self):
+    def test_clipped_attack_entry_is_not_safe_to_click(self):
         def buttons(frame):
             yield {'Text':'Attack!','X':300,'Y':45}
-            raise AssertionError('Should stop after the first entry')
+            return
         with tempfile.TemporaryDirectory(dir=COMBAT) as directory,ExitStack() as stack:
             self.adapters(stack)
             stack.enter_context(patch.object(campaign.app,'ENCOUNTER',Path(directory)))
+            stack.enter_context(patch.object(campaign.app,'OCR',Path(directory)))
             stack.enter_context(patch.object(campaign.app.ImageGrab,'grab',return_value=Image.new('RGB',(1366,768))))
             stack.enter_context(patch.object(campaign.app,'iter_attack_buttons',side_effect=buttons))
             ocr=stack.enter_context(patch.object(campaign.app,'recognize'))
             result=campaign.app.encounter(allow_empty=True,first_only=True,entry_only=True)
-        self.assertEqual(result['candidates'],1)
-        self.assertEqual(result['target']['Y'],45)
+        self.assertEqual(result['candidates'],0)
+        self.assertFalse(result['clear'])
         ocr.assert_not_called()
 
     def test_sweep_targets_front_unit_of_highest_health_column(self):
@@ -184,7 +228,7 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(result['status'],'complete')
             self.assertEqual(len(result['battles']),2)
 
-    def test_legacy_world_scope_never_drags_map(self):
+    def test_world_scope_checks_more_views_before_completion(self):
         with tempfile.TemporaryDirectory(dir=COMBAT) as directory,ExitStack() as stack:
             self.adapters(stack)
             stack.enter_context(patch.object(campaign,'COMBAT',Path(directory)))
@@ -192,24 +236,29 @@ class CampaignTests(unittest.TestCase):
             stack.enter_context(patch.object(campaign.settlement,'phase',return_value='map'))
             stack.enter_context(patch.object(campaign.app,'encounter',return_value={'candidates':0,'clear':True}))
             drag=stack.enter_context(patch.object(combat.mouse,'drag'))
+            survey=stack.enter_context(patch('world_survey.WorldSurvey')).return_value
+            survey.audit=[];survey.views=2
+            survey.next_view.side_effect=[True,False]
             result=campaign.run_campaign(scope='world')
-        self.assertEqual(result['scope'],'visible')
-        self.assertEqual(result['scanned_views'],3)
+        self.assertEqual(result['scope'],'world')
+        self.assertEqual(result['scanned_views'],6)
         self.assertEqual(result['status'],'complete')
+        self.assertTrue(result['world_boundaries_checked'])
         drag.assert_not_called()
 
-    def test_uncertain_cards_without_entry_do_not_stop_campaign(self):
+    def test_uncertain_cards_prevent_completion(self):
         with tempfile.TemporaryDirectory(dir=COMBAT) as directory,ExitStack() as stack:
             self.adapters(stack)
             stack.enter_context(patch.object(campaign,'COMBAT',Path(directory)))
             stack.enter_context(patch.object(campaign.ImageGrab,'grab',return_value=Image.new('RGB',(1366,768))))
             stack.enter_context(patch.object(campaign.settlement,'phase',return_value='map'))
             stack.enter_context(patch.object(campaign.app,'encounter',return_value={'candidates':0,'clear':False}))
-            result=campaign.run_campaign(scope='visible')
+            with self.assertRaises(RuntimeError):
+                campaign.run_campaign(scope='visible')
             import json
             result=json.loads((Path(directory)/'campaign-result.json').read_text(encoding='utf-8'))
-            self.assertEqual(result['status'],'complete')
-            self.assertTrue(result['no_attack_entry_confirmed'])
+            self.assertEqual(result['status'],'stopped')
+            self.assertNotIn('no_attack_entry_confirmed',result)
             self.assertNotIn('no_infected_confirmed',result)
 
 if __name__=='__main__':

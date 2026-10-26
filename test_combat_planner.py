@@ -13,6 +13,13 @@ def enemy(row,column,kind='crew',hp=1.):
 
 
 class PlannerTests(unittest.TestCase):
+    def test_global_direct_attack_confirms_on_front_unit(self):
+        gunner=get('heavy_gunner')
+        enemies=[enemy(2,4,'tank',.139),enemy(1,4,'brute',.3)]
+        options=plan({(489,335):gunner},enemies,{(489,335):(1,)})
+        self.assertEqual(options[0]['anchor'],[1,4])
+        self.assertEqual(options[0]['hit_count'],2)
+
     def test_heavy_gunner_models_fixed_sweep_and_forward_column_splash(self):
         models=get('heavy_gunner').skill_models
         main,splash=models[1].coverage((1,1))

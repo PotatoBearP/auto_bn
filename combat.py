@@ -17,6 +17,7 @@ from paths import COMBAT, TEMPLATES
 ROOT=COMBAT
 PLAYERS=[(489,335),(709,445)]
 SKILLS=unit_ai('heavy_gunner').skill_points
+UNREACHABLE_AIMS=set()
 
 class BattleEnded(RuntimeError):
     def __init__(self,image):
@@ -59,6 +60,7 @@ def wait_reticle(capture,timeout=6,reselect=None,skill=2,cooldown_reader=None):
             time.sleep(.2)
 
 def reset_battle_state():
+    UNREACHABLE_AIMS.clear()
     import battle_model
     battle_model.reset()
     (ROOT/'battle-state.json').write_text('{"initial": true}',encoding='utf-8')
@@ -127,6 +129,11 @@ def shape_template(name):
 
 
 def shape_matches(image,name,x,y):
+    if name=='tank':
+        colors=list(image.crop((x-22,y-55,x+22,y-15)).convert('RGB').getdata())
+        blue=sum(b>150 and b>r*1.5 and b>g*1.15 for r,g,b in colors)
+        red=sum(r>120 and r>g*1.6 and r>b*1.6 for r,g,b in colors)
+        if blue>50 and red<20: return False
     if name not in SHAPE_BOUNDS: return True
     left,top,right,bottom=SHAPE_BOUNDS[name]
     sample=image.crop((x+left,y+top,x+right,y+bottom)).convert('RGB').resize((36,34))
@@ -235,6 +242,17 @@ def skill_panel_visible(image):
         slots+=dark>600 or red>600
     return slots>=2
 
+def cooldown_notice(image):
+    """Only dismiss a positively identified weapon-cooldown notice."""
+    pixels=list(image.convert('RGB').crop((500,360,860,390)).getdata())
+    if sum(110<r<190 and abs(r-g)<12 and abs(g-b)<15 for r,g,b in pixels)<len(pixels)*.9:
+        return False
+    path=ROOT/'cooldown-notice.png'
+    image.crop((490,350,880,440)).resize((780,180)).save(path)
+    text=''.join(w['Text'] for w in app.recognize(path,'zh-Hans-CN',True))
+    return '才能使用' in text and '武器' in text
+
+
 def wait_our_turn(capture,require_transition=False,timeout=25,before_signature=None):
     """React to the returning panel; retain a longer health-only fallback."""
     deadline=time.monotonic()+timeout
@@ -267,13 +285,14 @@ def wait_our_turn(capture,require_transition=False,timeout=25,before_signature=N
     return latest,{'our_turn':False,'opponent_ui_disappearance_seen':saw_hidden}
 
 def cooldown(image,skill,read_turns=True):
-    x=281 if skill==1 else 385
-    pixels=list(image.convert('RGB').crop((x,701,x+3,704)).getdata())
+    if skill not in (1,2,3): raise ValueError('无效技能编号。')
+    x=277+104*(skill-1)
+    pixels=list(image.convert('RGB').crop((x,699,x+48,747)).getdata())
     red=sum(r>80 and r>g*2.5 and r>b*2.5 for r,g,b in pixels)
-    blocked=red>len(pixels)*.65
+    blocked=red>len(pixels)*.35
     turns=None
     if blocked and read_turns:
-        sx,sy=SKILLS[skill]
+        sx,sy=300+104*(skill-1),721
         crop=image.crop((sx-12,sy-13,sx+12,sy+14)).resize((144,162)).convert('RGB')
         mask=Image.new('L',crop.size,255)
         mask.putdata([0 if r>180 and g>130 and b<130 else 255 for r,g,b in crop.getdata()])
@@ -359,7 +378,7 @@ def reticle_center(image,enemies=None):
         {'score':round(best[0],3),'center':best[1],'search':'whole_battlefield'},
         ensure_ascii=False,indent=2),encoding='utf-8')
     if best[0]<.55:
-        raise RuntimeError('未可靠定位二技能蓝色瞄准中心，停止。')
+        raise RuntimeError('未可靠定位技能蓝色瞄准中心，停止。')
     return best[1]
 
 
@@ -427,6 +446,9 @@ def _combat_step(preview_only=False,force_skill=None,context=None):
     def capture():
         check();frame=ImageGrab.grab(bbox=box,all_screens=True)
         if settlement_phase(frame) in ('loot','experience'): raise BattleEnded(frame)
+        if cooldown_notice(frame):
+            check();mouse.click(box[0]+680,box[1]+480)
+            raise CombatRetry('已关闭技能冷却提示，重新读取技能状态。')
         turn_watchdog.observe(frame)
         return frame
     def click(point):
@@ -490,6 +512,23 @@ def _combat_step(preview_only=False,force_skill=None,context=None):
         if any(e['sprite']=='airflyer' for e in attrition_vision.enemies(image,include_air=True)):
             return attrition_pass('only_untargetable_air_units',allies)
     if not enemies:
+        # A persistent targeting ring can hide the last unit's torso. Move
+        # the existing aim off it before asking the sprite matcher again.
+        if any(ai.id=='elite_boxer' for ai in controllers.values()):
+            try:
+                origin=reticle_center(image)
+                safe=next(p for p in ((544,196),(984,416),(654,141))
+                          if abs(p[0]-origin[0])>100)
+                mouse.drag((box[0]+origin[0],box[1]+origin[1]),
+                           (box[0]+safe[0],box[1]+safe[1]),check)
+                time.sleep(.25);image=capture();enemies=observe_enemies(image)
+                turn_watchdog.event('uncover_last_enemy',{'origin':list(origin),'destination':list(safe),
+                                                        'recognized':len(enemies)})
+            except BattleEnded:
+                raise
+            except RuntimeError as exc:
+                check()
+                turn_watchdog.event('uncover_retry',{'reason':str(exc)})
         deadline=time.monotonic()+6
         while time.monotonic()<deadline and not enemies:
             time.sleep(.2);image=capture();enemies=observe_enemies(image)
@@ -510,7 +549,8 @@ def _combat_step(preview_only=False,force_skill=None,context=None):
     skills_for={player:(ai.available_skills(enemies) if hasattr(ai,'available_skills') else ai.skill_order)
                 for player,ai in controllers.items()}
     started=time.perf_counter()
-    candidates=plan(controllers,enemies,skills_for,force_skill,ally_health=ally_health)
+    candidates=plan(controllers,enemies,skills_for,force_skill,ally_health=ally_health,
+                    excluded_anchors=UNREACHABLE_AIMS)
     metrics['planning_ms']=round((time.perf_counter()-started)*1000,3)
     metrics['modeled_candidates']=len(candidates)
     report={'enemies':enemies,'allies':allies,'cooldowns':[],'options':[],
@@ -594,6 +634,9 @@ def _combat_step(preview_only=False,force_skill=None,context=None):
         time.sleep(ai.aim_settle_seconds)
         confirm=ai.locate_aim(capture,skill=skill)
         if abs(confirm[0]-target[0])>20 or abs(confirm[1]-target[1])>15:
+            UNREACHABLE_AIMS.add((ai.id,skill,tuple(chosen['anchor'])))
+            frame=capture();frame.save(ROOT/'unreachable-aim.png')
+            turn_watchdog.event('unreachable_aim',{'requested':list(target),'observed':list(confirm)})
             raise CombatRetry('瞄准圈未到达计算落点，重试执行。')
     else:
         time.sleep(ai.aim_settle_seconds);confirm=target
@@ -616,6 +659,7 @@ def _combat_step(preview_only=False,force_skill=None,context=None):
                   battle_ended=turn.get('battle_ended',False),after_health_bars=health_bars(after))
     report['release_evidence']=release_evidence(after,skill,turn,policy=ai)
     report['release_confirmed']=bool(report['release_evidence'])
+    if report['release_confirmed']: UNREACHABLE_AIMS.clear()
     if turn['our_turn'] and report['release_confirmed']: battle_model.update(after,advance=True)
     (ROOT/'combat-result.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
     return report
@@ -658,6 +702,6 @@ def combat_step(preview_only=False,force_skill=None):
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(); parser.add_argument('--preview',action='store_true')
-    parser.add_argument('--skill',type=int,choices=(1,2))
+    parser.add_argument('--skill',type=int,choices=(1,2,3))
     args=parser.parse_args()
     print(json.dumps(combat_step(args.preview,args.skill),ensure_ascii=True))

@@ -4,12 +4,17 @@
     {
       "row": 1,
       "column": 2,
-      "unit": "heavy_gunner"
+      "unit": "elite_boxer"
+    },
+    {
+      "row": 1,
+      "column": 3,
+      "unit": "elite_boxer"
     },
     {
       "row": 1,
       "column": 4,
-      "unit": "heavy_gunner"
+      "unit": "elite_boxer"
     }
   ]
 }

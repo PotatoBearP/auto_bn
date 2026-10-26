@@ -10,23 +10,25 @@ import control
 
 def move(x, y):
     control.check()
-    if win32api.GetSystemMetrics(win32con.SM_CMONITORS) > 1:
-        win32api.SetCursorPos((int(x),int(y)))
-    else:
-        width,height=win32api.GetSystemMetrics(0),win32api.GetSystemMetrics(1)
-        win32api.mouse_event(win32con.MOUSEEVENTF_ABSOLUTE|win32con.MOUSEEVENTF_MOVE,
-                             int(x*65535/width),int(y*65535/height),0,0)
+    import app
+    sx,sy=win32api.GetCursorPos()
+    for step in range(1,9):
+        control.check()
+        app.move_cursor_input(round(sx+(x-sx)*step/8),round(sy+(y-sy)*step/8))
+        time.sleep(.02)
 
 def down():
     control.check()
-    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN,0,0,0,0)
+    import app
+    app.send_mouse(0x0002)
 
 def scroll(delta):
     control.check()
     win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL,0,0,int(delta),0)
 
 def up():
-    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP,0,0,0,0)
+    import app
+    app.send_mouse(0x0004)
 
 def click(x,y):
     move(x,y); time.sleep(.3); down()
@@ -40,7 +42,11 @@ def drag(source,destination,check=lambda:None):
     check(); move(sx,sy); time.sleep(.35); check(); down()
     try:
         time.sleep(.15)
-        check(); move(dx,dy)
+        import app
+        for step in range(1,25):
+            check();control.check()
+            app.move_cursor_input(round(sx+(dx-sx)*step/24),round(sy+(dy-sy)*step/24))
+            time.sleep(.025)
         time.sleep(.25)
     finally:
         up()

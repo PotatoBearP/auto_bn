@@ -15,7 +15,7 @@ def open_editor(parent,on_saved=None,sweep=False):
     labels=choices();reverse={name:unit_id for unit_id,name in labels.items()}
     variables={}
     ttk.Label(window,text='自定义阵型（5 / 5 / 3）',font=('Microsoft YaHei UI',17,'bold')).pack(pady=(18,8))
-    ttk.Label(window,text='前排靠近敌方；胆小鬼仅限第一排；第 3 排只有中间三格。').pack()
+    ttk.Label(window,text='前排靠近敌方；胆小鬼、顶尖拳击手仅限第一排；第 3 排只有中间三格。').pack()
     board=ttk.Frame(window);board.pack(pady=18,padx=15)
     for row in range(1,4):
         for column in range(1,formation.ROWS[row-1]+1):

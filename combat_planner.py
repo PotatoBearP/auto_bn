@@ -10,7 +10,7 @@ def health_fraction(value):
     return max(0.,min(1.,value))
 
 
-def plan(controllers,enemies,skills_for,force_skill=None,ally_health=None):
+def plan(controllers,enemies,skills_for,force_skill=None,ally_health=None,excluded_anchors=None):
     active=target_priority.enabled(enemies)
     options=[]
     for player,ai in controllers.items():
@@ -19,7 +19,13 @@ def plan(controllers,enemies,skills_for,force_skill=None,ally_health=None):
             if force_skill is not None and skill!=force_skill: continue
             model=ai.skill_models[skill]
             seen=set()
-            for anchor in model.legal_anchors(enemies):
+            anchors=model.legal_anchors(enemies)
+            # A direct global attack still needs a clickable front unit.
+            # Rear units may be shielded even though the attack hits them.
+            if model.aiming=='direct' and model.absolute:
+                anchors=sorted(anchors)
+            for anchor in anchors:
+                if (ai.id,skill,tuple(anchor)) in (excluded_anchors or set()): continue
                 hits=model.predict(enemies,anchor)
                 if not hits: continue
                 signature=tuple(sorted((*enemy_cell(e),e['damage_band']) for e in hits))
@@ -35,6 +41,9 @@ def plan(controllers,enemies,skills_for,force_skill=None,ally_health=None):
                                     lambda subset:ai.evaluate(subset,skill)[1],active=active)})
     for option in options:
         option['selection_key']=option['priority_key']
+        if any(getattr(ai,'skill_priority',None) for ai in controllers.values()):
+            preference=getattr(controllers[tuple(option['unit'])],'skill_priority',{}).get(option['skill'],0)
+            option['selection_key']=(preference,)+option['selection_key']
         if target_priority.ATTRITION.get() and option['unit_id']=='coward':
             hp=(ally_health or {}).get(tuple(option['unit']))
             option['unit_hp_fraction']=hp

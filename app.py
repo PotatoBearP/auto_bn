@@ -156,8 +156,38 @@ def recognize(path, language='en-US', all_words=False):
     data = json.loads(result.stdout.strip() or '[]')
     return [data] if isinstance(data, dict) else (data or [])
 
+def minzoom_attack_buttons(image):
+    """Match the actual tiny Attack label even when its fill joins the card."""
+    import numpy as np
+    from PIL import Image
+    with Image.open(TEMPLATES/'map-attack-minzoom.png') as source:
+        template=np.asarray(source.convert('RGB'),dtype=np.int16)
+    pixels=np.asarray(image.convert('RGB'),dtype=np.int16)
+    h,w=template.shape[:2];height,width=pixels.shape[:2]
+    if height<h or width<w: return []
+    scores=np.zeros((height-h+1,width-w+1),dtype=np.float32)
+    samples=0
+    for y in range(1,h,3):
+        for x in range(1,w,5):
+            scores+=np.abs(pixels[y:y+scores.shape[0],x:x+scores.shape[1]]-template[y,x]).mean(axis=2)
+            samples+=1
+    ys,xs=np.where(scores/samples<23)
+    ranked=sorted(zip(ys,xs),key=lambda p:scores[p])
+    found=[]
+    for y,x in ranked:
+        if any(abs(x-p['X']+w//2)<40 and abs(y-p['Y']+h//2)<12 for p in found): continue
+        sample=pixels[y:y+h,x:x+w]
+        if np.abs(sample-template).mean()>23: continue
+        lettering=(template.min(axis=2)>185)
+        if lettering.any() and (sample.min(axis=2)[lettering]>165).mean()<.60: continue
+        found.append({'Text':'Attack!','X':int(x+w//2),'Y':int(y+h//2)})
+    return sorted(found,key=lambda p:(p['Y'],p['X']))
+
+
 def iter_attack_buttons(image):
     """Find ochre button interiors, then OCR each enlarged button."""
+    matched=minzoom_attack_buttons(image)
+    yield from matched
     width, height = image.size
     mask = bytearray(1 if (r > 90 and g > 45 and b < 90 and r > g*1.2 and g > b*1.3)
                      or (r>90 and g<65 and b<65 and r>g*2 and r>b*2) else 0
@@ -187,6 +217,7 @@ def iter_attack_buttons(image):
             rectangles.append((left, top, right+1, bottom+1))
     # OCR lazily in map reading order; stop consuming after the first infected.
     for rect in sorted(rectangles,key=lambda r:((r[1]+r[3])//2,(r[0]+r[2])//2)):
+        if any(abs((rect[0]+rect[2])//2-p['X'])<40 and abs((rect[1]+rect[3])//2-p['Y'])<12 for p in matched): continue
         control.check()
         crop = image.crop((max(0, rect[0]-3), max(0, rect[1]-3), min(width, rect[2]+3), min(height, rect[3]+3)))
         path = OCR / 'input-button.png'
@@ -229,20 +260,80 @@ def mammoth_card(image,attack):
         text=''.join(w['Text'] for w in recognize(path,'zh-Hans-CN',True))
     return '猛犸' in text or 'mammoth' in text.lower(),text
 
+@lru_cache(maxsize=1)
+def infected_map_avatar():
+    from PIL import Image
+    with Image.open(TEMPLATES/'infected-map-avatar.png') as source:
+        return source.convert('RGB')
+
+
+def card_avatar_matches(image,attack,reference):
+    x,y=attack['X'],attack['Y']
+    for dy in range(-8,9):
+        for dx in range(-10,11):
+            sample=image.crop((x-122+dx,y-41+dy,x-90+dx,y-9+dy)).convert('RGB')
+            if sum(ImageStat.Stat(ImageChops.difference(sample,reference)).mean)/3<18:
+                return True
+    return False
+
+
+def infected_avatar_matches(image,attack):
+    return card_avatar_matches(image,attack,infected_map_avatar())
+
+
+@lru_cache(maxsize=1)
+def pirate_map_avatar():
+    from PIL import Image
+    with Image.open(TEMPLATES/'pirate-map-avatar.png') as source:
+        return source.convert('RGB')
+
+
+def infected_portrait_entries(image):
+    """The portrait itself enters battle when an overlapping card hides Attack."""
+    import numpy as np
+    template=np.asarray(infected_map_avatar(),dtype=np.int16)
+    pixels=np.asarray(image.convert('RGB'),dtype=np.int16)
+    h,w=template.shape[:2]
+    if image.height<h or image.width<w: return []
+    scores=np.zeros((image.height-h+1,image.width-w+1),dtype=np.float32)
+    samples=0
+    for y in range(2,h,6):
+        for x in range(2,w,6):
+            scores+=np.abs(pixels[y:y+scores.shape[0],x:x+scores.shape[1]]-template[y,x]).mean(axis=2)
+            samples+=1
+    ys,xs=np.where(scores/samples<20)
+    found=[]
+    for y,x in sorted(zip(ys,xs),key=lambda p:scores[p]):
+        if any(abs(x+w//2-p['X'])<30 and abs(y+h//2-p['Y'])<30 for p in found): continue
+        if np.abs(pixels[y:y+h,x:x+w]-template).mean()>=18: continue
+        found.append({'Text':'感染者头像','X':int(x+w//2),'Y':int(y+h//2),
+                      'selection':'infected_avatar'})
+    return found
+
+
 def infected_candidates(image, attacks,first_only=False):
     """Check the title above Attack; avatar artwork may vary."""
     accepted, details = [], []
     for index, attack in enumerate(attacks):
         x, y = attack['X'], attack['Y']
+        if attack.get('selection')=='infected_avatar':
+            sample=image.crop((x-16,y-16,x+16,y+16)).convert('RGB')
+            if sum(ImageStat.Stat(ImageChops.difference(sample,infected_map_avatar())).mean)/3<18:
+                accepted.append({**attack,'enemy':'感染者','identity_evidence':'infected_avatar'})
+                details.append({'attack':attack,'text':'感染者头像匹配','infected':True})
+                if first_only: break
+            continue
         if y<80: continue # A clipped card has no complete title to verify.
-        region = (max(0, x-60), max(0, y-82), min(image.width, x+60), max(1, y-32))
+        # The minimum-zoom title is 40-50 px above this button. Keep the
+        # crop tight so an overlapping card above cannot supply its name.
+        region = (max(0, x-65), max(0, y-58), min(image.width, x+65), max(1, y-32))
         path = OCR / 'input-card.png'
         crop = image.crop(region)
         crop = crop.resize((crop.width*5, crop.height*5))
         crop.save(path)
         words = recognize(path, 'zh-Hans-CN', True)
         text = ''.join(word['Text'] for word in words)
-        if '感染者' not in text and not any(name in text for name in ('猛犸', '海盗')):
+        if '感染者' not in text and not any(name in text.lower() for name in ('猛犸', '海盗', 'mammoth', 'pirate')):
             for threshold in (200, 180, 210):
                 clean_path = OCR / 'input-card-clean.png'
                 cleaned_image = crop.convert('L').point(lambda value: 0 if value > threshold else 255)
@@ -251,10 +342,16 @@ def infected_candidates(image, attacks,first_only=False):
                 if '感染者' in cleaned:
                     text = cleaned
                     break
-        matched = '感染者' in text
+        portrait=infected_avatar_matches(image,attack)
+        if not portrait and card_avatar_matches(image,attack,mammoth_avatar()):
+            text='猛犸（头像核验）'
+        elif not portrait and card_avatar_matches(image,attack,pirate_map_avatar()):
+            text='海盗（头像核验）'
+        matched = ('感染者' in text or portrait) and not any(name in text.lower() for name in ('猛犸', '海盗', 'mammoth', 'pirate'))
         details.append({'attack': attack, 'text': text, 'infected': matched})
         if matched:
-            accepted.append({**attack, 'enemy': '感染者', 'card_text': text})
+            accepted.append({**attack, 'enemy': '感染者', 'card_text': text,
+                             'identity_evidence':'infected_avatar' if portrait else 'title_ocr'})
             if first_only: break
     (ENCOUNTER / 'detections.json').write_text(json.dumps(details, ensure_ascii=False, indent=2), encoding='utf-8')
     preview = image.copy()
@@ -295,27 +392,20 @@ def encounter(click=False,allow_empty=False,target=None,first_only=False,entry_o
             for attack in iter_attack_buttons(image):
                 attacks.append(attack)
                 yield attack
-        if entry_only:
-            candidates=[];details=[]
-            for attack in attacks_in_order():
-                excluded,text=mammoth_card(image,attack)
-                details.append({'attack':attack,'text':text,'infected':'感染者' in text,
-                                'entry_only':True,'excluded_mammoth':excluded})
-                if excluded: continue
-                candidates.append({**attack,'enemy':text or '未核对名称','selection':'visible_attack_entry'})
-                break
-            (ENCOUNTER/'detections.json').write_text(json.dumps(details,ensure_ascii=False,indent=2),encoding='utf-8')
-        else:
-            candidates=infected_candidates(image,attacks_in_order(),first_only=first_only or click)
+            for portrait in infected_portrait_entries(image):
+                attacks.append(portrait)
+                yield portrait
+        candidates=infected_candidates(image,attacks_in_order(),first_only=first_only or click or entry_only)
     else:
-        candidates=[target]
+        candidates=infected_candidates(image,[target],first_only=True)
     if not candidates:
         if allow_empty:
             details=json.loads((ENCOUNTER/'detections.json').read_text(encoding='utf-8'))
-            uncertain=[d for d in details if not d['text'].strip()]
+            uncertain=[d for d in details if not d['infected'] and not any(
+                name in d['text'].lower() for name in ('猛犸','海盗','mammoth','pirate'))]
             clipped=any(attack['Y']<80 for attack in attacks)
             return {'candidates':0,'clicked':False,'uncertain_cards':len(uncertain),
-                    'clipped_cards':clipped,'clear':entry_only or (not uncertain and not clipped)}
+                    'clipped_cards':clipped,'clear':not uncertain and not clipped}
         raise RuntimeError('未识别到感染者卡片中的 Attack，请查看 detections.png 和 detections.json。')
     target = candidates[0]
     x, y = box[0] + target['X'], box[1] + target['Y']
@@ -368,7 +458,7 @@ class App:
         self.deploy_button = ttk.Button(self.root, text='按已保存阵型布阵并开战',
                                        style='Action.TButton', command=self.run_deployment)
         self.deploy_button.pack(fill='x', padx=26, pady=(0,16))
-        self.combat_button = ttk.Button(self.root,text='分析并攻击一次（一、二技能）',
+        self.combat_button = ttk.Button(self.root,text='分析并攻击一次（按角色技能）',
                                         style='Action.TButton',command=self.run_combat)
         self.combat_button.pack(fill='x',padx=26,pady=(0,16))
         ttk.Button(self.root,text='敌方阵容模型（5 / 5 / 3 文字视图）',
@@ -376,11 +466,11 @@ class App:
         self.settlement_button = ttk.Button(self.root,text='确认战利品和经验，返回大地图',
                                              style='Action.TButton',command=self.run_settlement)
         self.settlement_button.pack(fill='x',padx=26,pady=(0,16))
-        self.scope_var=tk.StringVar(value='当前可见地图（不拖动）')
+        self.scope_var=tk.StringVar(value='全图清理（巡查地图边界）')
         self.scope_box=ttk.Combobox(self.root,textvariable=self.scope_var,
-                                    values=('当前可见地图（不拖动）',),state='readonly')
+                                    values=('全图清理（巡查地图边界）','当前可见地图（不拖动）'),state='readonly')
         self.scope_box.pack(fill='x',padx=26,pady=(0,10))
-        self.auto_button=ttk.Button(self.root,text='全自动清理：看到 Attack 入口就开打',
+        self.auto_button=ttk.Button(self.root,text='全自动清理感染者（避开猛犸和海盗）',
                                    style='Action.TButton',command=self.run_automatic)
         self.auto_button.pack(fill='x',padx=26,pady=(0,10))
         self.pvp_button=ttk.Button(self.root,text='全自动 PVP 送分循环（哈哈笑 + 7 单位）',
@@ -571,7 +661,7 @@ class App:
 
     def run_automatic(self,resume=False):
         control.reset()
-        scope='visible'
+        scope='world' if self.scope_var.get().startswith('全图') else 'visible'
         for button in self.action_buttons(): button.configure(state='disabled')
         self.stop_button.configure(state='normal')
         self.scope_box.configure(state='disabled')
@@ -616,7 +706,7 @@ if __name__ == '__main__':
     parser.add_argument('--enter', action='store_true')
     parser.add_argument('--replace-gui', action='store_true')
     parser.add_argument('--auto',action='store_true')
-    parser.add_argument('--scope',choices=('world','visible'),default='visible')
+    parser.add_argument('--scope',choices=('world','visible'),default='world')
     parser.add_argument('--resume',action='store_true')
     parser.add_argument('--sweep',action='store_true')
     parser.add_argument('--attrition',action='store_true')
@@ -630,7 +720,7 @@ if __name__ == '__main__':
         instance=App()
         if args.attrition_battles is not None:
             instance.attrition_rounds.set(str(args.attrition_battles))
-        instance.scope_var.set('当前可见地图（不拖动）')
+        instance.scope_var.set('全图清理（巡查地图边界）' if args.scope=='world' else '当前可见地图（不拖动）')
         if args.attrition: instance.root.after(300,instance.run_attrition)
         elif args.sweep: instance.root.after(300,instance.run_sweep)
         elif args.auto: instance.root.after(300,lambda:instance.run_automatic(args.resume))
